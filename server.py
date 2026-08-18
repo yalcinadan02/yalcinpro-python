@@ -1,35 +1,9 @@
 from flask import Flask, jsonify, request
 import yfinance as yf
+import os
 
 app = Flask(__name__)
 
-
-def get_stock(symbol):
-    ticker = yf.Ticker(symbol + ".IS")
-
-    data = ticker.history(period="2d")
-
-    if data.empty:
-        return None
-
-    last = data.iloc[-1]
-
-    price = float(last["Close"])
-
-    if len(data) >= 2:
-        previous = float(data.iloc[-2]["Close"])
-        change = ((price - previous) / previous) * 100
-    else:
-        previous = price
-        change = 0.0
-
-    return {
-        "sembol": symbol,
-        "fiyat": round(price, 2),
-        "oncekiKapanis": round(previous, 2),
-        "degisimYuzde": round(change, 2),
-        "paraBirimi": "TRY"
-    }
 
 @app.route("/stocks")
 def stocks():
@@ -47,39 +21,86 @@ def stocks():
         if s.strip()
     ]
 
+    # Yahoo Finance sembolleri
+    yahoo_symbols = [symbol + ".IS" for symbol in symbols]
+
     results = []
 
-    # Aynı anda 10 hisse çek
-    import concurrent.futures
+    try:
+        # TÜM hisseleri tek seferde indiriyoruz.
+        data = yf.download(
+            yahoo_symbols,
+            period="2d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True
+        )
 
-    def fetch(symbol):
-        try:
-            return get_stock(symbol)
-        except Exception as e:
-            print(f"Hisse hatası {symbol}: {e}")
-            return None
+        for symbol, yahoo_symbol in zip(symbols, yahoo_symbols):
+            try:
+                # Tek hisse durumunda kolon yapısı farklı olabilir.
+                if len(yahoo_symbols) == 1:
+                    stock_data = data
+                else:
+                    if yahoo_symbol not in data.columns.get_level_values(0):
+                        continue
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [
-            executor.submit(fetch, symbol)
-            for symbol in symbols
-        ]
+                    stock_data = data[yahoo_symbol]
 
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
+                stock_data = stock_data.dropna(subset=["Close"])
 
-            if result is not None:
-                results.append(result)
+                if stock_data.empty:
+                    continue
 
-    print("YALCIN PRO - PYTHON STOCKS TAMAMLANDI:", len(results))
+                last = stock_data.iloc[-1]
+                price = float(last["Close"])
+
+                if len(stock_data) >= 2:
+                    previous = float(stock_data.iloc[-2]["Close"])
+                    change = ((price - previous) / previous) * 100
+                else:
+                    previous = price
+                    change = 0.0
+
+                results.append({
+                    "sembol": symbol,
+                    "fiyat": round(price, 2),
+                    "oncekiKapanis": round(previous, 2),
+                    "degisimYuzde": round(change, 2),
+                    "paraBirimi": "TRY"
+                })
+
+            except Exception as e:
+                print(f"Hisse işleme hatası {symbol}: {e}")
+
+    except Exception as e:
+        print(f"Yahoo Finance toplu veri hatası: {e}")
+
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "data": []
+        }), 500
+
+    print(
+        "YALCIN PRO - PYTHON STOCKS TAMAMLANDI:",
+        len(results),
+        "/",
+        len(symbols)
+    )
 
     return jsonify({
         "success": True,
         "data": results
     })
+
+
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+
     app.run(
         host="0.0.0.0",
-        port=5000,
+        port=port,
         debug=False
     )
