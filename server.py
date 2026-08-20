@@ -1,8 +1,8 @@
-
-  from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request
 import yfinance as yf
 import concurrent.futures
 import os
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -10,16 +10,41 @@ app = Flask(__name__)
 
 ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 
+# =============================================================
+# AYARLAR
+# =============================================================
 
-def get_stock(symbol):
+BATCH_SIZE = 25
+MAX_WORKERS = 4
+
+# İlk istekte gelmeyen hisseler için tekrar deneme
+MISSING_RETRY_COUNT = 3
+RETRY_WAIT_SECONDS = 1.5
+
+
+def normalize_symbol(symbol):
+    return symbol.strip().upper()
+
+
+def get_stock(symbol, retry_count=0):
+    """
+    Tek hisseyi Yahoo Finance'tan alır.
+
+    Öncelik:
+    1) 1 dakikalık gün içi veri
+    2) 5 günlük günlük veri
+    3) Eksik/boş sonuçta tekrar deneme
+    """
+
+    symbol = normalize_symbol(symbol)
+
     try:
-        symbol = symbol.strip().upper()
-
         ticker = yf.Ticker(symbol + ".IS")
 
-        # =========================================================
+        # =====================================================
         # 1 - GÜN İÇİ / CANLI FİYAT
-        # =========================================================
+        # =====================================================
+
         intraday = ticker.history(
             period="1d",
             interval="1m",
@@ -32,12 +57,13 @@ def get_stock(symbol):
         )
 
         if intraday.empty:
+
             print(
                 f"YALCIN PRO - {symbol}: "
                 f"1 DAKIKALIK VERI YOK"
             )
 
-            # Canlı veri gelmezse günlük veriye düş
+            # Canlı veri yoksa günlük veriye düş
             daily_fallback = ticker.history(
                 period="5d",
                 interval="1d",
@@ -49,21 +75,25 @@ def get_stock(symbol):
             )
 
             if daily_fallback.empty:
-                return None
+                raise ValueError(
+                    "Günlük veri de bulunamadı"
+                )
 
             price = float(
                 daily_fallback.iloc[-1]["Close"]
             )
 
         else:
+
             # Gün içindeki en son fiyat
             price = float(
                 intraday.iloc[-1]["Close"]
             )
 
-        # =========================================================
+        # =====================================================
         # 2 - GÜNLÜK VERİ
-        # =========================================================
+        # =====================================================
+
         daily = ticker.history(
             period="5d",
             interval="1d",
@@ -75,11 +105,14 @@ def get_stock(symbol):
         )
 
         if daily.empty:
-            return None
+            raise ValueError(
+                "Günlük veri bulunamadı"
+            )
 
-        # =========================================================
+        # =====================================================
         # 3 - ÖNCEKİ KAPANIŞ
-        # =========================================================
+        # =====================================================
+
         now_istanbul = datetime.now(
             ISTANBUL_TZ
         )
@@ -92,15 +125,15 @@ def get_stock(symbol):
             last_daily_date == today
             and len(daily) >= 2
         ):
-            # Bugünün devam eden seansı varsa
-            # bir önceki tamamlanmış günün kapanışı
+            # Bugünün devam eden seansı varsa,
+            # bir önceki tamamlanmış günün kapanışı.
             previous = float(
                 daily.iloc[-2]["Close"]
             )
 
         elif len(daily) >= 2:
-            # Piyasa kapalıysa son işlem gününün
-            # kapanışını kullan
+            # Piyasa kapalıysa son günlük verinin
+            # kapanışı mevcut fiyatla karşılaştırılır.
             previous = float(
                 daily.iloc[-1]["Close"]
             )
@@ -108,9 +141,10 @@ def get_stock(symbol):
         else:
             previous = price
 
-        # =========================================================
+        # =====================================================
         # 4 - DEĞİŞİM YÜZDESİ
-        # =========================================================
+        # =====================================================
+
         if previous != 0:
             change = (
                 (price - previous)
@@ -119,9 +153,10 @@ def get_stock(symbol):
         else:
             change = 0.0
 
-        # =========================================================
+        # =====================================================
         # 5 - DEBUG LOG
-        # =========================================================
+        # =====================================================
+
         print(
             f"YALCIN PRO - {symbol} | "
             f"CANLI={price:.4f} | "
@@ -129,7 +164,7 @@ def get_stock(symbol):
             f"DEGISIM={change:.4f}%"
         )
 
-        # Son 3 günlük kapanışı göster
+        # Son 3 günlük kapanış
         try:
             print(
                 f"YALCIN PRO - {symbol} "
@@ -139,7 +174,7 @@ def get_stock(symbol):
         except Exception:
             pass
 
-        # Son 3 dakikalık veriyi göster
+        # Son 3 dakikalık veri
         try:
             if not intraday.empty:
                 print(
@@ -150,9 +185,10 @@ def get_stock(symbol):
         except Exception:
             pass
 
-        # =========================================================
+        # =====================================================
         # 6 - ANDROID'A GÖNDERİLECEK VERİ
-        # =========================================================
+        # =====================================================
+
         return {
             "sembol": symbol,
             "fiyat": round(price, 2),
@@ -162,9 +198,38 @@ def get_stock(symbol):
         }
 
     except Exception as e:
+
         print(
             f"YALCIN PRO - HISSE HATASI "
             f"{symbol}: {e}"
+        )
+
+        # =====================================================
+        # EKSİK HİSSEYİ TEKRAR DENE
+        # =====================================================
+
+        if retry_count < MISSING_RETRY_COUNT:
+
+            attempt = retry_count + 1
+
+            print(
+                f"YALCIN PRO - {symbol} "
+                f"TEKRAR DENENIYOR "
+                f"({attempt}/{MISSING_RETRY_COUNT})"
+            )
+
+            time.sleep(
+                RETRY_WAIT_SECONDS * attempt
+            )
+
+            return get_stock(
+                symbol,
+                retry_count=attempt
+            )
+
+        print(
+            f"YALCIN PRO - {symbol}: "
+            f"3 DENEME SONRASI VERI YOK"
         )
 
         return None
@@ -176,6 +241,7 @@ def get_stock(symbol):
 
 @app.route("/health")
 def health():
+
     return jsonify({
         "success": True,
         "status": "online"
@@ -189,11 +255,12 @@ def health():
 @app.route("/stock/<sembol>")
 def single_stock(sembol):
 
-    symbol = sembol.strip().upper()
+    symbol = normalize_symbol(sembol)
 
     result = get_stock(symbol)
 
     if result is None:
+
         return jsonify({
             "success": False,
             "data": []
@@ -218,6 +285,7 @@ def stocks():
     )
 
     if not symbols_text:
+
         return jsonify({
             "success": False,
             "error": "symbols parametresi gerekli",
@@ -225,11 +293,11 @@ def stocks():
         }), 400
 
     # ---------------------------------------------------------
-    # Sembolleri temizle
+    # SEMBOLLERİ TEMİZLE
     # ---------------------------------------------------------
 
     symbols = [
-        s.strip().upper()
+        normalize_symbol(s)
         for s in symbols_text.split(",")
         if s.strip()
     ]
@@ -239,6 +307,9 @@ def stocks():
         dict.fromkeys(symbols)
     )
 
+    print(
+        "================================================="
+    )
     print(
         "YALCIN PRO - ISTENEN HISSE SAYISI:",
         len(symbols)
@@ -250,14 +321,12 @@ def stocks():
     # GRUPLARA AYIR
     # ---------------------------------------------------------
 
-    batch_size = 25
-
     batches = [
-        symbols[i:i + batch_size]
+        symbols[i:i + BATCH_SIZE]
         for i in range(
             0,
             len(symbols),
-            batch_size
+            BATCH_SIZE
         )
     ]
 
@@ -279,20 +348,18 @@ def stocks():
             result = get_stock(symbol)
 
             if result is not None:
-                batch_results.append(
-                    result
-                )
+                batch_results.append(result)
 
         return batch_results
 
     # ---------------------------------------------------------
-    # PARALEL ÇALIŞTIR
+    # İLK TUR - PARALEL
     # ---------------------------------------------------------
 
     try:
 
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=4
+            max_workers=MAX_WORKERS
         ) as executor:
 
             futures = [
@@ -340,18 +407,146 @@ def stocks():
         )
 
     # =========================================================
-    # ANDROID'DEKİ SIRAYI KORU
+    # İLK SONUÇLARI SEMBOLE GÖRE HARİTALA
     # =========================================================
 
-    result_map = {
-        item["sembol"]: item
-        for item in results
-    }
+    result_map = {}
+
+    for item in results:
+
+        symbol = normalize_symbol(
+            item.get("sembol", "")
+        )
+
+        if symbol:
+            result_map[symbol] = item
+
+    # =========================================================
+    # ÇOK ÖNEMLİ:
+    # İLK TURDA GELMEYEN HİSSELERİ TESPİT ET
+    # =========================================================
+
+    missing_symbols = [
+        symbol
+        for symbol in symbols
+        if symbol not in result_map
+    ]
+
+    print(
+        "YALCIN PRO - ILK TUR SONRASI:",
+        len(result_map),
+        "/",
+        len(symbols)
+    )
+
+    print(
+        "YALCIN PRO - EKSIK HISSE SAYISI:",
+        len(missing_symbols)
+    )
+
+    if missing_symbols:
+
+        print(
+            "YALCIN PRO - EKSIK HISSELER:",
+            ", ".join(missing_symbols)
+        )
+
+        # =====================================================
+        # İKİNCİ TUR
+        # Sadece eksik hisseleri tekrar sorgula.
+        # Bu turda daha düşük eşzamanlılık kullanıyoruz.
+        # =====================================================
+
+        def retry_missing(symbol):
+
+            print(
+                f"YALCIN PRO - "
+                f"EKSIK HISSE TEKRAR SORULUYOR: "
+                f"{symbol}"
+            )
+
+            # get_stock kendi içinde 3 kez deniyor.
+            return get_stock(symbol)
+
+        try:
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2
+            ) as retry_executor:
+
+                retry_futures = {
+                    retry_executor.submit(
+                        retry_missing,
+                        symbol
+                    ): symbol
+                    for symbol in missing_symbols
+                }
+
+                for future in concurrent.futures.as_completed(
+                    retry_futures
+                ):
+
+                    symbol = retry_futures[future]
+
+                    try:
+
+                        retry_result = future.result()
+
+                        if retry_result is not None:
+
+                            normalized = normalize_symbol(
+                                retry_result["sembol"]
+                            )
+
+                            result_map[
+                                normalized
+                            ] = retry_result
+
+                            print(
+                                "YALCIN PRO - "
+                                "EKSIK HISSE BULUNDU:",
+                                normalized
+                            )
+
+                        else:
+
+                            print(
+                                "YALCIN PRO - "
+                                "EKSIK HISSE HALA YOK:",
+                                symbol
+                            )
+
+                    except Exception as e:
+
+                        print(
+                            "YALCIN PRO - "
+                            "EKSIK HISSE HATASI:",
+                            symbol,
+                            e
+                        )
+
+        except Exception as e:
+
+            print(
+                "YALCIN PRO - "
+                "IKINCI TUR HATASI:",
+                e
+            )
+
+    # =========================================================
+    # ANDROID'DEKİ SIRAYI KORU
+    # =========================================================
 
     ordered_results = [
         result_map[symbol]
         for symbol in symbols
         if symbol in result_map
+    ]
+
+    final_missing = [
+        symbol
+        for symbol in symbols
+        if symbol not in result_map
     ]
 
     print(
@@ -360,6 +555,25 @@ def stocks():
         len(ordered_results),
         "/",
         len(symbols)
+    )
+
+    if final_missing:
+
+        print(
+            "YALCIN PRO - "
+            "SON HALDE VERİSİ OLMAYANLAR:",
+            ", ".join(final_missing)
+        )
+
+    else:
+
+        print(
+            "YALCIN PRO - "
+            "TÜM HISSELERDEN VERI GELDI."
+        )
+
+    print(
+        "================================================="
     )
 
     # =========================================================
@@ -390,3 +604,4 @@ if __name__ == "__main__":
         port=port,
         debug=False
     )
+
