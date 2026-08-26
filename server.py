@@ -14,17 +14,12 @@ ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 # AYARLAR
 # =============================================================
 
-# Daha küçük gruplar -> Yahoo'ya daha az yük
 BATCH_SIZE = 10
-
-# Aynı anda daha az işlem
 MAX_WORKERS = 2
 
-# Eksik hisseler için tekrar deneme
 MISSING_RETRY_COUNT = 3
 RETRY_WAIT_SECONDS = 2.0
 
-# Cache
 CACHE_TTL_SECONDS = 45
 
 _stock_cache = {}
@@ -36,7 +31,16 @@ _cache_lock = __import__("threading").Lock()
 # =============================================================
 
 def normalize_symbol(symbol):
-    return symbol.strip().upper()
+    if not symbol:
+        return ""
+
+    return (
+        str(symbol)
+        .strip()
+        .upper()
+        .replace(".IS", "")
+        .replace(" ", "")
+    )
 
 
 # =============================================================
@@ -64,57 +68,255 @@ def _save_stock(symbol, result):
 
 
 # =============================================================
+# YAHOO CLOSE ÇIKAR
+# =============================================================
+
+def _extract_close(data, ticker_name):
+    """
+    yfinance MultiIndex yapısında Close kolonunu güvenli şekilde bulur.
+    """
+
+    if data is None or data.empty:
+        return None
+
+    try:
+
+        # MultiIndex
+        if hasattr(data.columns, "levels"):
+
+            level0 = data.columns.get_level_values(0)
+            level1 = data.columns.get_level_values(1)
+
+            # Yapı:
+            # Ticker -> Close
+            if ticker_name in level0:
+
+                ticker_data = data[ticker_name]
+
+                if "Close" in ticker_data.columns:
+                    return ticker_data["Close"].dropna()
+
+            # Yapı:
+            # Close -> Ticker
+            if "Close" in level0 and ticker_name in level1:
+
+                return data["Close"][ticker_name].dropna()
+
+        # Tek hisse / normal kolon
+        if "Close" in data.columns:
+            return data["Close"].dropna()
+
+    except Exception as e:
+
+        print(
+            f"YALCIN PRO - CLOSE OKUMA HATASI "
+            f"{ticker_name}: {e}"
+        )
+
+    return None
+
+
+# =============================================================
 # SONUÇ OLUŞTUR
 # =============================================================
 
-def _make_result(symbol, closes):
+def _make_result(symbol, closes, previous_close=None):
+
     try:
+        if closes is None:
+            return None
+
         closes = closes.dropna()
+
     except Exception:
         return None
 
     if closes.empty:
         return None
 
+    # ---------------------------------------------------------
+    # CANLI / SON FİYAT
+    # ---------------------------------------------------------
+
     try:
         price = float(closes.iloc[-1])
     except Exception:
         return None
 
-    # Önceki işlem gününün son kapanışı
-    try:
-        dates = list(dict.fromkeys(closes.index.date))
+    if price <= 0:
+        return None
 
-        if len(dates) >= 2:
-            previous_date = dates[-2]
-            previous_values = closes[
-                closes.index.date == previous_date
-            ]
+    # ---------------------------------------------------------
+    # ÖNCEKİ KAPANIŞ
+    # ---------------------------------------------------------
+    #
+    # Öncelik:
+    # 1) Günlük Yahoo verisinden gelen previous_close
+    # 2) Eğer yoksa intraday içinden farklı gün aranır
+    # 3) Son çare fiyatın kendisi
+    #
 
-            previous = float(previous_values.iloc[-1])
-        else:
-            previous = price
+    previous = None
 
-    except Exception:
+    # 1. Günlük veriden gelen kesin önceki kapanış
+    if previous_close is not None:
+
+        try:
+
+            previous_value = float(previous_close)
+
+            if previous_value > 0:
+                previous = previous_value
+
+        except Exception:
+            previous = None
+
+    # 2. Günlük veri gelmezse intraday içinden bul
+    if previous is None:
+
+        try:
+
+            dates = list(
+                dict.fromkeys(
+                    closes.index.date
+                )
+            )
+
+            if len(dates) >= 2:
+
+                previous_date = dates[-2]
+
+                previous_values = closes[
+                    closes.index.date == previous_date
+                ]
+
+                if not previous_values.empty:
+
+                    previous_value = float(
+                        previous_values.iloc[-1]
+                    )
+
+                    if previous_value > 0:
+                        previous = previous_value
+
+        except Exception:
+            previous = None
+
+    # 3. Son çare
+    if previous is None:
         previous = price
 
-    change = (
-        ((price - previous) / previous * 100.0)
-        if previous
-        else 0.0
-    )
+    # ---------------------------------------------------------
+    # DEĞİŞİM YÜZDESİ
+    # ---------------------------------------------------------
+
+    try:
+
+        change = (
+            (price - previous)
+            / previous
+            * 100.0
+        ) if previous > 0 else 0.0
+
+    except Exception:
+        change = 0.0
+
+    # Çok küçük sayısal hataları temizle
+    if abs(change) < 0.000001:
+        change = 0.0
 
     result = {
-        "sembol": symbol,
+        "sembol": normalize_symbol(symbol),
         "fiyat": round(price, 2),
         "oncekiKapanis": round(previous, 2),
         "degisimYuzde": round(change, 2),
         "paraBirimi": "TRY"
     }
 
-    _save_stock(symbol, result)
+    print(
+        "YALCIN PRO - VERI:",
+        result["sembol"],
+        "| FIYAT:",
+        result["fiyat"],
+        "| ONCEKI:",
+        result["oncekiKapanis"],
+        "| DEGISIM:",
+        result["degisimYuzde"]
+    )
+
+    _save_stock(
+        normalize_symbol(symbol),
+        result
+    )
 
     return result
+
+
+# =============================================================
+# GÜNLÜK ÖNCEKİ KAPANIŞ
+# =============================================================
+
+def get_previous_close(symbol):
+
+    symbol = normalize_symbol(symbol)
+
+    ticker_name = symbol + ".IS"
+
+    try:
+
+        daily = yf.download(
+            tickers=ticker_name,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            prepost=False,
+            threads=False,
+            progress=False
+        )
+
+        closes = _extract_close(
+            daily,
+            ticker_name
+        )
+
+        if closes is None or closes.empty:
+            return None
+
+        closes = closes.dropna()
+
+        if len(closes) < 2:
+
+            print(
+                f"YALCIN PRO - {symbol}: "
+                "GUNLUK ONCEKI KAPANIS YOK"
+            )
+
+            return None
+
+        # Son günlük kayıt bugün,
+        # bir önceki kayıt önceki işlem günüdür.
+        previous = float(
+            closes.iloc[-2]
+        )
+
+        if previous <= 0:
+            return None
+
+        print(
+            f"YALCIN PRO - {symbol}: "
+            f"ONCEKI KAPANIS = {previous:.2f}"
+        )
+
+        return previous
+
+    except Exception as e:
+
+        print(
+            f"YALCIN PRO - {symbol}: "
+            f"ONCEKI KAPANIS HATASI: {e}"
+        )
+
+        return None
 
 
 # =============================================================
@@ -122,23 +324,31 @@ def _make_result(symbol, closes):
 # =============================================================
 
 def get_stock(symbol, retry_count=0):
-    """
-    Tek hisse verisini alır.
-    Önce cache kontrol edilir.
-    """
 
     symbol = normalize_symbol(symbol)
 
     cached = _cached_stock(symbol)
 
     if cached is not None:
-        print(f"YALCIN PRO - {symbol}: CACHE")
+
+        print(
+            f"YALCIN PRO - {symbol}: CACHE"
+        )
+
         return cached
 
     try:
-        ticker = yf.Ticker(symbol + ".IS")
 
-        # Daha hafif sorgu
+        ticker_name = symbol + ".IS"
+
+        ticker = yf.Ticker(
+            ticker_name
+        )
+
+        # -----------------------------------------------------
+        # 1. CANLI / INTRADAY
+        # -----------------------------------------------------
+
         intraday = ticker.history(
             period="2d",
             interval="5m",
@@ -146,12 +356,24 @@ def get_stock(symbol, retry_count=0):
             prepost=False
         )
 
-        # Intraday yoksa günlük veriye düş
+        closes = None
+
         if (
-            intraday is None
-            or intraday.empty
-            or "Close" not in intraday.columns
+            intraday is not None
+            and not intraday.empty
+            and "Close" in intraday.columns
         ):
+
+            closes = (
+                intraday["Close"]
+                .dropna()
+            )
+
+        # -----------------------------------------------------
+        # 2. INTRADAY YOKSA GÜNLÜK VERİ
+        # -----------------------------------------------------
+
+        if closes is None or closes.empty:
 
             daily = ticker.history(
                 period="5d",
@@ -164,43 +386,45 @@ def get_stock(symbol, retry_count=0):
                 or daily.empty
                 or "Close" not in daily.columns
             ):
-                raise ValueError("Veri bulunamadı")
 
-            closes = daily["Close"].dropna()
+                raise ValueError(
+                    "Veri bulunamadı"
+                )
 
-            if closes.empty:
-                raise ValueError("Kapanış verisi bulunamadı")
-
-            price = float(closes.iloc[-1])
-
-            previous = (
-                float(closes.iloc[-2])
-                if len(closes) >= 2
-                else price
+            closes = (
+                daily["Close"]
+                .dropna()
             )
 
-            change = (
-                ((price - previous) / previous * 100.0)
-                if previous
-                else 0.0
+        if closes.empty:
+            raise ValueError(
+                "Kapanış verisi bulunamadı"
             )
 
-            result = {
-                "sembol": symbol,
-                "fiyat": round(price, 2),
-                "oncekiKapanis": round(previous, 2),
-                "degisimYuzde": round(change, 2),
-                "paraBirimi": "TRY"
-            }
+        # -----------------------------------------------------
+        # 3. ÖNCEKİ KAPANIŞI GÜNLÜK VERİDEN AL
+        # -----------------------------------------------------
 
-            _save_stock(symbol, result)
-
-            return result
-
-        return _make_result(
-            symbol,
-            intraday["Close"]
+        previous_close = (
+            get_previous_close(symbol)
         )
+
+        # -----------------------------------------------------
+        # 4. SONUCU OLUŞTUR
+        # -----------------------------------------------------
+
+        result = _make_result(
+            symbol,
+            closes,
+            previous_close
+        )
+
+        if result is None:
+            raise ValueError(
+                "Sonuç oluşturulamadı"
+            )
+
+        return result
 
     except Exception as e:
 
@@ -211,7 +435,10 @@ def get_stock(symbol, retry_count=0):
             f"{symbol}: {text}"
         )
 
-        # Kontrollü tekrar deneme
+        # -----------------------------------------------------
+        # RETRY
+        # -----------------------------------------------------
+
         if retry_count < 2:
 
             if (
@@ -219,9 +446,16 @@ def get_stock(symbol, retry_count=0):
                 or "Rate limited" in text
                 or "429" in text
             ):
-                wait = 8 * (retry_count + 1)
+
+                wait = 8 * (
+                    retry_count + 1
+                )
+
             else:
-                wait = 3 * (retry_count + 1)
+
+                wait = 3 * (
+                    retry_count + 1
+                )
 
             print(
                 f"YALCIN PRO - {symbol} "
@@ -244,109 +478,188 @@ def get_stock(symbol, retry_count=0):
 # =============================================================
 
 def get_stocks_batch(symbols):
-    """
-    Küçük bir sembol grubunu Yahoo'dan alır.
-    """
 
     results = []
     missing = []
 
     tickers = [
-        symbol + ".IS"
+        normalize_symbol(symbol) + ".IS"
         for symbol in symbols
     ]
 
     try:
 
         print(
-            "YALCIN PRO - YAHOO TOPLU İSTEK:",
+            "YALCIN PRO - YAHOO TOPLU ISTEK:",
             len(tickers),
             "HISSE"
         )
 
-        data = yf.download(
-            tickers=tickers,
+        # -----------------------------------------------------
+        # 1. INTRADAY VERİ
+        # -----------------------------------------------------
 
-            # Daha hafif veri
+        intraday_data = yf.download(
+            tickers=tickers,
             period="2d",
             interval="5m",
-
             group_by="ticker",
             auto_adjust=False,
             prepost=False,
-
-            # Aynı anda fazla bağlantı açma
             threads=False,
-
             progress=False
         )
 
-        if data is None or data.empty:
+        # -----------------------------------------------------
+        # 2. GÜNLÜK VERİ
+        # -----------------------------------------------------
+        #
+        # Önceki kapanışları burada ayrı alıyoruz.
+        #
+
+        daily_data = yf.download(
+            tickers=tickers,
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            prepost=False,
+            threads=False,
+            progress=False
+        )
+
+        if (
+            intraday_data is None
+            or intraday_data.empty
+        ):
+
             print(
-                "YALCIN PRO - TOPLU VERİ BOŞ"
+                "YALCIN PRO - "
+                "TOPLU INTRADAY VERİ BOŞ"
             )
 
             return [], list(symbols)
 
+        # -----------------------------------------------------
+        # 3. HİSSELERİ TEK TEK İŞLE
+        # -----------------------------------------------------
+
         for symbol in symbols:
+
+            symbol = normalize_symbol(
+                symbol
+            )
 
             ticker_name = symbol + ".IS"
 
             try:
 
-                # MultiIndex
-                if hasattr(data.columns, "levels"):
+                # ---------------------------------------------
+                # INTRADAY CLOSE
+                # ---------------------------------------------
 
-                    level0 = data.columns.get_level_values(0)
-                    level1 = data.columns.get_level_values(1)
+                closes = _extract_close(
+                    intraday_data,
+                    ticker_name
+                )
 
-                    if ticker_name in level0:
+                if (
+                    closes is None
+                    or closes.empty
+                ):
 
-                        closes = data[
-                            ticker_name
-                        ]["Close"]
+                    # Günlük veriyi son çare olarak kullan
+                    closes = _extract_close(
+                        daily_data,
+                        ticker_name
+                    )
 
-                    elif (
-                        "Close" in level0
-                        and ticker_name in level1
-                    ):
+                if (
+                    closes is None
+                    or closes.empty
+                ):
 
-                        closes = data[
-                            "Close"
-                        ][ticker_name]
+                    print(
+                        f"YALCIN PRO - "
+                        f"{symbol}: "
+                        f"INTRADAY VERI YOK"
+                    )
 
-                    else:
-                        raise KeyError(
-                            "Ticker kolonu yok"
-                        )
+                    missing.append(
+                        symbol
+                    )
 
-                else:
+                    continue
 
-                    if "Close" not in data.columns:
-                        raise KeyError(
-                            "Close kolonu yok"
-                        )
+                # ---------------------------------------------
+                # ÖNCEKİ KAPANIŞ
+                # ---------------------------------------------
 
-                    closes = data["Close"]
+                daily_closes = _extract_close(
+                    daily_data,
+                    ticker_name
+                )
+
+                previous_close = None
+
+                if (
+                    daily_closes is not None
+                    and not daily_closes.empty
+                ):
+
+                    daily_closes = (
+                        daily_closes
+                        .dropna()
+                    )
+
+                    if len(daily_closes) >= 2:
+
+                        try:
+
+                            previous_close = float(
+                                daily_closes.iloc[-2]
+                            )
+
+                            if previous_close <= 0:
+                                previous_close = None
+
+                        except Exception:
+
+                            previous_close = None
+
+                # ---------------------------------------------
+                # SONUCU OLUŞTUR
+                # ---------------------------------------------
 
                 result = _make_result(
                     symbol,
-                    closes
+                    closes,
+                    previous_close
                 )
 
                 if result is not None:
-                    results.append(result)
+
+                    results.append(
+                        result
+                    )
+
                 else:
-                    missing.append(symbol)
+
+                    missing.append(
+                        symbol
+                    )
 
             except Exception as e:
 
                 print(
                     f"YALCIN PRO - "
-                    f"{symbol} TOPLU VERİ HATASI: {e}"
+                    f"{symbol} TOPLU VERİ HATASI: "
+                    f"{e}"
                 )
 
-                missing.append(symbol)
+                missing.append(
+                    symbol
+                )
 
     except Exception as e:
 
@@ -381,9 +694,13 @@ def health():
 @app.route("/stock/<sembol>")
 def single_stock(sembol):
 
-    symbol = normalize_symbol(sembol)
+    symbol = normalize_symbol(
+        sembol
+    )
 
-    result = get_stock(symbol)
+    result = get_stock(
+        symbol
+    )
 
     if result is None:
 
@@ -394,7 +711,9 @@ def single_stock(sembol):
 
     return jsonify({
         "success": True,
-        "data": [result]
+        "data": [
+            result
+        ]
     })
 
 
@@ -485,10 +804,14 @@ def stocks():
             )
 
             batch_results, batch_missing = (
-                get_stocks_batch(batch)
+                get_stocks_batch(
+                    batch
+                )
             )
 
-            results.extend(batch_results)
+            results.extend(
+                batch_results
+            )
 
             print(
                 "YALCIN PRO - "
@@ -502,15 +825,18 @@ def stocks():
 
             # Yahoo'yu yormamak için bekle
             if batch_index < len(batches):
-                time.sleep(1.5)
+
+                time.sleep(
+                    1.5
+                )
 
     except Exception as e:
 
         print(
-            "YALCIN PRO - GENEL HATA:",
+            "YALCIN PRO - "
+            "GENEL HATA:",
             e
         )
-
 
     # =========================================================
     # İLK SONUÇLARI SEMBOLE GÖRE HARİTALA
@@ -528,8 +854,9 @@ def stocks():
         )
 
         if symbol:
-            result_map[symbol] = item
-
+            result_map[
+                symbol
+            ] = item
 
     # =========================================================
     # EKSİK HİSSELER
@@ -555,7 +882,6 @@ def stocks():
         len(missing_symbols)
     )
 
-
     # =========================================================
     # İKİNCİ TUR
     # =========================================================
@@ -565,7 +891,9 @@ def stocks():
         print(
             "YALCIN PRO - "
             "EKSIK HISSELER:",
-            ", ".join(missing_symbols)
+            ", ".join(
+                missing_symbols
+            )
         )
 
         for retry_round in range(
@@ -573,7 +901,6 @@ def stocks():
             MISSING_RETRY_COUNT + 1
         ):
 
-            # Hala eksik olanları yeniden hesapla
             current_missing = [
                 symbol
                 for symbol in symbols
@@ -662,7 +989,9 @@ def stocks():
                     )
 
                 # Gruplar arasında bekle
-                if retry_index < len(retry_batches):
+                if retry_index < len(
+                    retry_batches
+                ):
 
                     time.sleep(
                         RETRY_WAIT_SECONDS
@@ -674,7 +1003,6 @@ def stocks():
                 time.sleep(
                     RETRY_WAIT_SECONDS
                 )
-
 
     # =========================================================
     # ANDROID'DEKİ SIRAYI KORU
@@ -705,7 +1033,9 @@ def stocks():
         print(
             "YALCIN PRO - "
             "SON HALDE VERİSİ OLMAYANLAR:",
-            ", ".join(final_missing)
+            ", ".join(
+                final_missing
+            )
         )
 
     else:
@@ -718,7 +1048,6 @@ def stocks():
     print(
         "================================================="
     )
-
 
     # =========================================================
     # JSON
