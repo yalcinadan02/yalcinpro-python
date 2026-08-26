@@ -14,225 +14,351 @@ ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 # AYARLAR
 # =============================================================
 
-BATCH_SIZE = 25
-MAX_WORKERS = 4
+# Daha küçük gruplar -> Yahoo'ya daha az yük
+BATCH_SIZE = 10
 
-# İlk istekte gelmeyen hisseler için tekrar deneme
+# Aynı anda daha az işlem
+MAX_WORKERS = 2
+
+# Eksik hisseler için tekrar deneme
 MISSING_RETRY_COUNT = 3
-RETRY_WAIT_SECONDS = 1.5
+RETRY_WAIT_SECONDS = 2.0
 
+# Cache
+CACHE_TTL_SECONDS = 45
+
+_stock_cache = {}
+_cache_lock = __import__("threading").Lock()
+
+
+# =============================================================
+# SEMBOL
+# =============================================================
 
 def normalize_symbol(symbol):
     return symbol.strip().upper()
 
 
+# =============================================================
+# CACHE
+# =============================================================
+
+def _cached_stock(symbol):
+    now = time.time()
+
+    with _cache_lock:
+        item = _stock_cache.get(symbol)
+
+        if item and now - item[0] < CACHE_TTL_SECONDS:
+            return item[1]
+
+        if item:
+            _stock_cache.pop(symbol, None)
+
+    return None
+
+
+def _save_stock(symbol, result):
+    with _cache_lock:
+        _stock_cache[symbol] = (time.time(), result)
+
+
+# =============================================================
+# SONUÇ OLUŞTUR
+# =============================================================
+
+def _make_result(symbol, closes):
+    try:
+        closes = closes.dropna()
+    except Exception:
+        return None
+
+    if closes.empty:
+        return None
+
+    try:
+        price = float(closes.iloc[-1])
+    except Exception:
+        return None
+
+    # Önceki işlem gününün son kapanışı
+    try:
+        dates = list(dict.fromkeys(closes.index.date))
+
+        if len(dates) >= 2:
+            previous_date = dates[-2]
+            previous_values = closes[
+                closes.index.date == previous_date
+            ]
+
+            previous = float(previous_values.iloc[-1])
+        else:
+            previous = price
+
+    except Exception:
+        previous = price
+
+    change = (
+        ((price - previous) / previous * 100.0)
+        if previous
+        else 0.0
+    )
+
+    result = {
+        "sembol": symbol,
+        "fiyat": round(price, 2),
+        "oncekiKapanis": round(previous, 2),
+        "degisimYuzde": round(change, 2),
+        "paraBirimi": "TRY"
+    }
+
+    _save_stock(symbol, result)
+
+    return result
+
+
+# =============================================================
+# TEK HİSSE
+# =============================================================
+
 def get_stock(symbol, retry_count=0):
     """
-    Tek hisseyi Yahoo Finance'tan alır.
-
-    Öncelik:
-    1) 1 dakikalık gün içi veri
-    2) 5 günlük günlük veri
-    3) Eksik/boş sonuçta tekrar deneme
+    Tek hisse verisini alır.
+    Önce cache kontrol edilir.
     """
 
     symbol = normalize_symbol(symbol)
 
+    cached = _cached_stock(symbol)
+
+    if cached is not None:
+        print(f"YALCIN PRO - {symbol}: CACHE")
+        return cached
+
     try:
         ticker = yf.Ticker(symbol + ".IS")
 
-        # =====================================================
-        # 1 - GÜN İÇİ / CANLI FİYAT
-        # =====================================================
-
+        # Daha hafif sorgu
         intraday = ticker.history(
-            period="1d",
-            interval="1m",
+            period="2d",
+            interval="5m",
             auto_adjust=False,
             prepost=False
         )
 
-        intraday = intraday.dropna(
-            subset=["Close"]
-        )
+        # Intraday yoksa günlük veriye düş
+        if (
+            intraday is None
+            or intraday.empty
+            or "Close" not in intraday.columns
+        ):
 
-        if intraday.empty:
-
-            print(
-                f"YALCIN PRO - {symbol}: "
-                f"1 DAKIKALIK VERI YOK"
-            )
-
-            # Canlı veri yoksa günlük veriye düş
-            daily_fallback = ticker.history(
+            daily = ticker.history(
                 period="5d",
                 interval="1d",
                 auto_adjust=False
             )
 
-            daily_fallback = daily_fallback.dropna(
-                subset=["Close"]
+            if (
+                daily is None
+                or daily.empty
+                or "Close" not in daily.columns
+            ):
+                raise ValueError("Veri bulunamadı")
+
+            closes = daily["Close"].dropna()
+
+            if closes.empty:
+                raise ValueError("Kapanış verisi bulunamadı")
+
+            price = float(closes.iloc[-1])
+
+            previous = (
+                float(closes.iloc[-2])
+                if len(closes) >= 2
+                else price
             )
 
-            if daily_fallback.empty:
-                raise ValueError(
-                    "Günlük veri de bulunamadı"
-                )
-
-            price = float(
-                daily_fallback.iloc[-1]["Close"]
-            )
-
-        else:
-
-            # Gün içindeki en son fiyat
-            price = float(
-                intraday.iloc[-1]["Close"]
-            )
-
-        # =====================================================
-        # 2 - GÜNLÜK VERİ
-        # =====================================================
-
-        daily = ticker.history(
-            period="5d",
-            interval="1d",
-            auto_adjust=False
-        )
-
-        daily = daily.dropna(
-            subset=["Close"]
-        )
-
-        if daily.empty:
-            raise ValueError(
-                "Günlük veri bulunamadı"
-            )
-
-        # =====================================================
-        # 3 - ÖNCEKİ KAPANIŞ
-        # =====================================================
-
-        now_istanbul = datetime.now(
-            ISTANBUL_TZ
-        )
-
-        today = now_istanbul.date()
-
-        last_daily_date = daily.index[-1].date()
-
-        if (
-            last_daily_date == today
-            and len(daily) >= 2
-        ):
-            # Bugünün devam eden seansı varsa,
-            # bir önceki tamamlanmış günün kapanışı.
-            previous = float(
-                daily.iloc[-2]["Close"]
-            )
-
-        elif len(daily) >= 2:
-            # Piyasa kapalıysa son günlük verinin
-            # kapanışı mevcut fiyatla karşılaştırılır.
-            previous = float(
-                daily.iloc[-1]["Close"]
-            )
-
-        else:
-            previous = price
-
-        # =====================================================
-        # 4 - DEĞİŞİM YÜZDESİ
-        # =====================================================
-
-        if previous != 0:
             change = (
-                (price - previous)
-                / previous
-            ) * 100.0
-        else:
-            change = 0.0
+                ((price - previous) / previous * 100.0)
+                if previous
+                else 0.0
+            )
 
-        # =====================================================
-        # 5 - DEBUG LOG
-        # =====================================================
+            result = {
+                "sembol": symbol,
+                "fiyat": round(price, 2),
+                "oncekiKapanis": round(previous, 2),
+                "degisimYuzde": round(change, 2),
+                "paraBirimi": "TRY"
+            }
+
+            _save_stock(symbol, result)
+
+            return result
+
+        return _make_result(
+            symbol,
+            intraday["Close"]
+        )
+
+    except Exception as e:
+
+        text = str(e)
 
         print(
-            f"YALCIN PRO - {symbol} | "
-            f"CANLI={price:.4f} | "
-            f"ONCEKI={previous:.4f} | "
-            f"DEGISIM={change:.4f}%"
+            f"YALCIN PRO - HISSE HATASI "
+            f"{symbol}: {text}"
         )
 
-        # Son 3 günlük kapanış
-        try:
+        # Kontrollü tekrar deneme
+        if retry_count < 2:
+
+            if (
+                "Too Many Requests" in text
+                or "Rate limited" in text
+                or "429" in text
+            ):
+                wait = 8 * (retry_count + 1)
+            else:
+                wait = 3 * (retry_count + 1)
+
             print(
                 f"YALCIN PRO - {symbol} "
-                f"SON GUNLUK VERILER: "
-                f"{daily[['Close']].tail(3).to_dict()}"
+                f"RETRY {retry_count + 1}/2 | "
+                f"{wait} sn bekle"
             )
-        except Exception:
-            pass
 
-        # Son 3 dakikalık veri
-        try:
-            if not intraday.empty:
-                print(
-                    f"YALCIN PRO - {symbol} "
-                    f"SON DAKIKALIK VERILER: "
-                    f"{intraday[['Close']].tail(3).to_dict()}"
+            time.sleep(wait)
+
+            return get_stock(
+                symbol,
+                retry_count + 1
+            )
+
+        return None
+
+
+# =============================================================
+# TOPLU HİSSE
+# =============================================================
+
+def get_stocks_batch(symbols):
+    """
+    Küçük bir sembol grubunu Yahoo'dan alır.
+    """
+
+    results = []
+    missing = []
+
+    tickers = [
+        symbol + ".IS"
+        for symbol in symbols
+    ]
+
+    try:
+
+        print(
+            "YALCIN PRO - YAHOO TOPLU İSTEK:",
+            len(tickers),
+            "HISSE"
+        )
+
+        data = yf.download(
+            tickers=tickers,
+
+            # Daha hafif veri
+            period="2d",
+            interval="5m",
+
+            group_by="ticker",
+            auto_adjust=False,
+            prepost=False,
+
+            # Aynı anda fazla bağlantı açma
+            threads=False,
+
+            progress=False
+        )
+
+        if data is None or data.empty:
+            print(
+                "YALCIN PRO - TOPLU VERİ BOŞ"
+            )
+
+            return [], list(symbols)
+
+        for symbol in symbols:
+
+            ticker_name = symbol + ".IS"
+
+            try:
+
+                # MultiIndex
+                if hasattr(data.columns, "levels"):
+
+                    level0 = data.columns.get_level_values(0)
+                    level1 = data.columns.get_level_values(1)
+
+                    if ticker_name in level0:
+
+                        closes = data[
+                            ticker_name
+                        ]["Close"]
+
+                    elif (
+                        "Close" in level0
+                        and ticker_name in level1
+                    ):
+
+                        closes = data[
+                            "Close"
+                        ][ticker_name]
+
+                    else:
+                        raise KeyError(
+                            "Ticker kolonu yok"
+                        )
+
+                else:
+
+                    if "Close" not in data.columns:
+                        raise KeyError(
+                            "Close kolonu yok"
+                        )
+
+                    closes = data["Close"]
+
+                result = _make_result(
+                    symbol,
+                    closes
                 )
-        except Exception:
-            pass
 
-        # =====================================================
-        # 6 - ANDROID'A GÖNDERİLECEK VERİ
-        # =====================================================
+                if result is not None:
+                    results.append(result)
+                else:
+                    missing.append(symbol)
 
-        return {
-            "sembol": symbol,
-            "fiyat": round(price, 2),
-            "oncekiKapanis": round(previous, 2),
-            "degisimYuzde": round(change, 2),
-            "paraBirimi": "TRY"
-        }
+            except Exception as e:
+
+                print(
+                    f"YALCIN PRO - "
+                    f"{symbol} TOPLU VERİ HATASI: {e}"
+                )
+
+                missing.append(symbol)
 
     except Exception as e:
 
         print(
-            f"YALCIN PRO - HISSE HATASI "
-            f"{symbol}: {e}"
+            "YALCIN PRO - "
+            "TOPLU YAHOO HATASI:",
+            e
         )
 
-        # =====================================================
-        # EKSİK HİSSEYİ TEKRAR DENE
-        # =====================================================
+        missing = list(symbols)
 
-        if retry_count < MISSING_RETRY_COUNT:
-
-            attempt = retry_count + 1
-
-            print(
-                f"YALCIN PRO - {symbol} "
-                f"TEKRAR DENENIYOR "
-                f"({attempt}/{MISSING_RETRY_COUNT})"
-            )
-
-            time.sleep(
-                RETRY_WAIT_SECONDS * attempt
-            )
-
-            return get_stock(
-                symbol,
-                retry_count=attempt
-            )
-
-        print(
-            f"YALCIN PRO - {symbol}: "
-            f"3 DENEME SONRASI VERI YOK"
-        )
-
-        return None
+    return results, missing
 
 
 # =============================================================
@@ -310,6 +436,7 @@ def stocks():
     print(
         "================================================="
     )
+
     print(
         "YALCIN PRO - ISTENEN HISSE SAYISI:",
         len(symbols)
@@ -336,75 +463,54 @@ def stocks():
     )
 
     # ---------------------------------------------------------
-    # BİR GRUBU ÇALIŞTIR
-    # ---------------------------------------------------------
-
-    def fetch_batch(batch):
-
-        batch_results = []
-
-        for symbol in batch:
-
-            result = get_stock(symbol)
-
-            if result is not None:
-                batch_results.append(result)
-
-        return batch_results
-
-    # ---------------------------------------------------------
-    # İLK TUR - PARALEL
+    # İLK TUR
     # ---------------------------------------------------------
 
     try:
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=MAX_WORKERS
-        ) as executor:
+        for batch_index, batch in enumerate(
+            batches,
+            start=1
+        ):
 
-            futures = [
-                executor.submit(
-                    fetch_batch,
-                    batch
-                )
-                for batch in batches
-            ]
+            print(
+                "YALCIN PRO - "
+                "TOPLU GRUP:",
+                batch_index,
+                "/",
+                len(batches),
+                "|",
+                len(batch),
+                "HISSE"
+            )
 
-            for future in concurrent.futures.as_completed(
-                futures
-            ):
+            batch_results, batch_missing = (
+                get_stocks_batch(batch)
+            )
 
-                try:
+            results.extend(batch_results)
 
-                    batch_results = future.result()
+            print(
+                "YALCIN PRO - "
+                "GRUP TAMAMLANDI:",
+                len(batch_results),
+                "| EKSIK:",
+                len(batch_missing),
+                "| TOPLAM:",
+                len(results)
+            )
 
-                    results.extend(
-                        batch_results
-                    )
-
-                    print(
-                        "YALCIN PRO - "
-                        "GRUP TAMAMLANDI:",
-                        len(batch_results),
-                        "| TOPLAM:",
-                        len(results)
-                    )
-
-                except Exception as e:
-
-                    print(
-                        "YALCIN PRO - "
-                        "GRUP HATASI:",
-                        e
-                    )
+            # Yahoo'yu yormamak için bekle
+            if batch_index < len(batches):
+                time.sleep(1.5)
 
     except Exception as e:
 
         print(
-            "YALCIN PRO - "
-            "GENEL HATA:",
+            "YALCIN PRO - GENEL HATA:",
             e
         )
+
 
     # =========================================================
     # İLK SONUÇLARI SEMBOLE GÖRE HARİTALA
@@ -415,15 +521,18 @@ def stocks():
     for item in results:
 
         symbol = normalize_symbol(
-            item.get("sembol", "")
+            item.get(
+                "sembol",
+                ""
+            )
         )
 
         if symbol:
             result_map[symbol] = item
 
+
     # =========================================================
-    # ÇOK ÖNEMLİ:
-    # İLK TURDA GELMEYEN HİSSELERİ TESPİT ET
+    # EKSİK HİSSELER
     # =========================================================
 
     missing_symbols = [
@@ -433,105 +542,139 @@ def stocks():
     ]
 
     print(
-        "YALCIN PRO - ILK TUR SONRASI:",
+        "YALCIN PRO - "
+        "ILK TUR SONRASI:",
         len(result_map),
         "/",
         len(symbols)
     )
 
     print(
-        "YALCIN PRO - EKSIK HISSE SAYISI:",
+        "YALCIN PRO - "
+        "EKSIK HISSE SAYISI:",
         len(missing_symbols)
     )
+
+
+    # =========================================================
+    # İKİNCİ TUR
+    # =========================================================
 
     if missing_symbols:
 
         print(
-            "YALCIN PRO - EKSIK HISSELER:",
+            "YALCIN PRO - "
+            "EKSIK HISSELER:",
             ", ".join(missing_symbols)
         )
 
-        # =====================================================
-        # İKİNCİ TUR
-        # Sadece eksik hisseleri tekrar sorgula.
-        # Bu turda daha düşük eşzamanlılık kullanıyoruz.
-        # =====================================================
+        for retry_round in range(
+            1,
+            MISSING_RETRY_COUNT + 1
+        ):
 
-        def retry_missing(symbol):
+            # Hala eksik olanları yeniden hesapla
+            current_missing = [
+                symbol
+                for symbol in symbols
+                if symbol not in result_map
+            ]
 
-            print(
-                f"YALCIN PRO - "
-                f"EKSIK HISSE TEKRAR SORULUYOR: "
-                f"{symbol}"
-            )
-
-            # get_stock kendi içinde 3 kez deniyor.
-            return get_stock(symbol)
-
-        try:
-
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=2
-            ) as retry_executor:
-
-                retry_futures = {
-                    retry_executor.submit(
-                        retry_missing,
-                        symbol
-                    ): symbol
-                    for symbol in missing_symbols
-                }
-
-                for future in concurrent.futures.as_completed(
-                    retry_futures
-                ):
-
-                    symbol = retry_futures[future]
-
-                    try:
-
-                        retry_result = future.result()
-
-                        if retry_result is not None:
-
-                            normalized = normalize_symbol(
-                                retry_result["sembol"]
-                            )
-
-                            result_map[
-                                normalized
-                            ] = retry_result
-
-                            print(
-                                "YALCIN PRO - "
-                                "EKSIK HISSE BULUNDU:",
-                                normalized
-                            )
-
-                        else:
-
-                            print(
-                                "YALCIN PRO - "
-                                "EKSIK HISSE HALA YOK:",
-                                symbol
-                            )
-
-                    except Exception as e:
-
-                        print(
-                            "YALCIN PRO - "
-                            "EKSIK HISSE HATASI:",
-                            symbol,
-                            e
-                        )
-
-        except Exception as e:
+            if not current_missing:
+                break
 
             print(
                 "YALCIN PRO - "
-                "IKINCI TUR HATASI:",
-                e
+                "EKSIK TUR:",
+                retry_round,
+                "/",
+                MISSING_RETRY_COUNT,
+                "|",
+                len(current_missing),
+                "HISSE"
             )
+
+            retry_batches = [
+                current_missing[i:i + BATCH_SIZE]
+                for i in range(
+                    0,
+                    len(current_missing),
+                    BATCH_SIZE
+                )
+            ]
+
+            for retry_index, retry_batch in enumerate(
+                retry_batches,
+                start=1
+            ):
+
+                print(
+                    "YALCIN PRO - "
+                    "EKSIK GRUP:",
+                    retry_index,
+                    "/",
+                    len(retry_batches),
+                    "|",
+                    len(retry_batch),
+                    "HISSE"
+                )
+
+                try:
+
+                    retry_results, still_missing = (
+                        get_stocks_batch(
+                            retry_batch
+                        )
+                    )
+
+                    for retry_result in retry_results:
+
+                        normalized = normalize_symbol(
+                            retry_result["sembol"]
+                        )
+
+                        result_map[
+                            normalized
+                        ] = retry_result
+
+                        print(
+                            "YALCIN PRO - "
+                            "EKSIK HISSE BULUNDU:",
+                            normalized
+                        )
+
+                    if still_missing:
+
+                        print(
+                            "YALCIN PRO - "
+                            "BU TURDA HALA EKSIK:",
+                            ", ".join(
+                                still_missing
+                            )
+                        )
+
+                except Exception as e:
+
+                    print(
+                        "YALCIN PRO - "
+                        "EKSIK GRUP HATASI:",
+                        e
+                    )
+
+                # Gruplar arasında bekle
+                if retry_index < len(retry_batches):
+
+                    time.sleep(
+                        RETRY_WAIT_SECONDS
+                    )
+
+            # Bir sonraki eksik turdan önce bekle
+            if retry_round < MISSING_RETRY_COUNT:
+
+                time.sleep(
+                    RETRY_WAIT_SECONDS
+                )
+
 
     # =========================================================
     # ANDROID'DEKİ SIRAYI KORU
@@ -576,6 +719,7 @@ def stocks():
         "================================================="
     )
 
+
     # =========================================================
     # JSON
     # =========================================================
@@ -604,4 +748,3 @@ if __name__ == "__main__":
         port=port,
         debug=False
     )
-
