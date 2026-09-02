@@ -14,11 +14,11 @@ ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 # AYARLAR
 # =============================================================
 
-BATCH_SIZE = 10
-MAX_WORKERS = 2
+BATCH_SIZE = 25
+MAX_WORKERS = 3
 
 MISSING_RETRY_COUNT = 3
-RETRY_WAIT_SECONDS = 2.0
+RETRY_WAIT_SECONDS = 1.0
 
 CACHE_TTL_SECONDS = 45
 
@@ -782,19 +782,23 @@ def stocks():
     )
 
     # ---------------------------------------------------------
-    # İLK TUR
+    # İLK TUR - PARALEL
     # ---------------------------------------------------------
 
     try:
 
-        for batch_index, batch in enumerate(
-            batches,
-            start=1
-        ):
+        print(
+            "YALCIN PRO - PARALEL İLK TUR:",
+            len(batches),
+            "GRUP | WORKERS:",
+            MAX_WORKERS
+        )
+
+        def run_batch(batch_info):
+            batch_index, batch = batch_info
 
             print(
-                "YALCIN PRO - "
-                "TOPLU GRUP:",
+                "YALCIN PRO - TOPLU GRUP:",
                 batch_index,
                 "/",
                 len(batches),
@@ -803,38 +807,59 @@ def stocks():
                 "HISSE"
             )
 
-            batch_results, batch_missing = (
-                get_stocks_batch(
-                    batch
+            try:
+                batch_results, batch_missing = get_stocks_batch(batch)
+
+                return batch_index, batch_results, batch_missing
+
+            except Exception as e:
+                print(
+                    "YALCIN PRO - GRUP HATASI:",
+                    batch_index,
+                    e
                 )
-            )
+                return batch_index, [], list(batch)
 
-            results.extend(
-                batch_results
-            )
+        batch_infos = list(
+            enumerate(batches, start=1)
+        )
 
-            print(
-                "YALCIN PRO - "
-                "GRUP TAMAMLANDI:",
-                len(batch_results),
-                "| EKSIK:",
-                len(batch_missing),
-                "| TOPLAM:",
-                len(results)
-            )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_WORKERS
+        ) as executor:
 
-            # Yahoo'yu yormamak için bekle
-            if batch_index < len(batches):
+            futures = [
+                executor.submit(
+                    run_batch,
+                    item
+                )
+                for item in batch_infos
+            ]
 
-                time.sleep(
-                    1.5
+            for future in concurrent.futures.as_completed(futures):
+
+                batch_index, batch_results, batch_missing = (
+                    future.result()
+                )
+
+                results.extend(batch_results)
+
+                print(
+                    "YALCIN PRO - GRUP TAMAMLANDI:",
+                    batch_index,
+                    "| GELEN:",
+                    len(batch_results),
+                    "| EKSIK:",
+                    len(batch_missing),
+                    "| TOPLAM:",
+                    len(results)
                 )
 
     except Exception as e:
 
         print(
-            "YALCIN PRO - "
-            "GENEL HATA:",
+            "YALCIN PRO - ",
+            "GENEL PARALEL HATA:",
             e
         )
 
