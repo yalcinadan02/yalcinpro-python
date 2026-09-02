@@ -350,7 +350,7 @@ def get_stock(symbol, retry_count=0):
         # -----------------------------------------------------
 
         intraday = ticker.history(
-            period="2d",
+            period="1d",
             interval="5m",
             auto_adjust=False,
             prepost=False
@@ -501,7 +501,7 @@ def get_stocks_batch(symbols):
 
         intraday_data = yf.download(
             tickers=tickers,
-            period="2d",
+            period="1d",
             interval="5m",
             group_by="ticker",
             auto_adjust=False,
@@ -782,23 +782,19 @@ def stocks():
     )
 
     # ---------------------------------------------------------
-    # İLK TUR - PARALEL
+    # İLK TUR
     # ---------------------------------------------------------
 
     try:
 
-        print(
-            "YALCIN PRO - PARALEL İLK TUR:",
-            len(batches),
-            "GRUP | WORKERS:",
-            MAX_WORKERS
-        )
-
-        def run_batch(batch_info):
-            batch_index, batch = batch_info
+        for batch_index, batch in enumerate(
+            batches,
+            start=1
+        ):
 
             print(
-                "YALCIN PRO - TOPLU GRUP:",
+                "YALCIN PRO - "
+                "TOPLU GRUP:",
                 batch_index,
                 "/",
                 len(batches),
@@ -807,59 +803,32 @@ def stocks():
                 "HISSE"
             )
 
-            try:
-                batch_results, batch_missing = get_stocks_batch(batch)
-
-                return batch_index, batch_results, batch_missing
-
-            except Exception as e:
-                print(
-                    "YALCIN PRO - GRUP HATASI:",
-                    batch_index,
-                    e
+            batch_results, batch_missing = (
+                get_stocks_batch(
+                    batch
                 )
-                return batch_index, [], list(batch)
+            )
 
-        batch_infos = list(
-            enumerate(batches, start=1)
-        )
+            results.extend(
+                batch_results
+            )
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=MAX_WORKERS
-        ) as executor:
+            print(
+                "YALCIN PRO - "
+                "GRUP TAMAMLANDI:",
+                len(batch_results),
+                "| EKSIK:",
+                len(batch_missing),
+                "| TOPLAM:",
+                len(results)
+            )
 
-            futures = [
-                executor.submit(
-                    run_batch,
-                    item
-                )
-                for item in batch_infos
-            ]
-
-            for future in concurrent.futures.as_completed(futures):
-
-                batch_index, batch_results, batch_missing = (
-                    future.result()
-                )
-
-                results.extend(batch_results)
-
-                print(
-                    "YALCIN PRO - GRUP TAMAMLANDI:",
-                    batch_index,
-                    "| GELEN:",
-                    len(batch_results),
-                    "| EKSIK:",
-                    len(batch_missing),
-                    "| TOPLAM:",
-                    len(results)
-                )
 
     except Exception as e:
 
         print(
-            "YALCIN PRO - ",
-            "GENEL PARALEL HATA:",
+            "YALCIN PRO - "
+            "GENEL HATA:",
             e
         )
 
@@ -1100,5 +1069,6 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=port,
-        debug=False
+        debug=False,
+        threaded=True
     )
