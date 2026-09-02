@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 import yfinance as yf
 import concurrent.futures
+import threading
 import os
 import time
 from datetime import datetime
@@ -23,7 +24,15 @@ RETRY_WAIT_SECONDS = 1.0
 CACHE_TTL_SECONDS = 30
 
 _stock_cache = {}
-_cache_lock = __import__("threading").Lock()
+_cache_lock = threading.Lock()
+
+# Arka plan cache yenileme durumu
+_warm_lock = threading.Lock()
+_warm_thread = None
+_warm_symbols = []
+_warm_running = False
+_warm_last_started = 0.0
+WARM_INTERVAL_SECONDS = 25
 
 
 # =============================================================
@@ -48,17 +57,12 @@ def normalize_symbol(symbol):
 # =============================================================
 
 def _cached_stock(symbol):
-    now = time.time()
-
+    # Stale-while-revalidate: eski veri silinmez. Böylece cache yenilenirken
+    # Android boş liste görmez; arka plan yeni veriyi üzerine yazar.
     with _cache_lock:
         item = _stock_cache.get(symbol)
-
-        if item and now - item[0] < CACHE_TTL_SECONDS:
-            return item[1]
-
         if item:
-            _stock_cache.pop(symbol, None)
-
+            return item[1]
     return None
 
 
@@ -675,6 +679,125 @@ def get_stocks_batch(symbols):
 
 
 # =============================================================
+# ARKA PLAN CACHE ISITMA / YENILEME
+# =============================================================
+
+def _cache_snapshot_count(symbols):
+    count = 0
+    with _cache_lock:
+        for symbol in symbols:
+            item = _stock_cache.get(symbol)
+            if item is not None:
+                count += 1
+    return count
+
+
+def _warm_cache_once(symbols):
+    """Yahoo'dan verileri bloklamadan arka planda toplar."""
+    global _warm_running
+
+    normalized = list(dict.fromkeys(
+        normalize_symbol(s) for s in symbols if normalize_symbol(s)
+    ))
+
+    batches = [
+        normalized[i:i + BATCH_SIZE]
+        for i in range(0, len(normalized), BATCH_SIZE)
+    ]
+
+    print("YALCIN PRO - ARKA PLAN CACHE BASLIYOR:", len(normalized), "HISSE | GRUP:", len(batches))
+
+    total_before = _cache_snapshot_count(normalized)
+
+    try:
+        # Batch'leri paralel çalıştırıyoruz; her batch kendi Yahoo isteğini yapar.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_map = {
+                executor.submit(get_stocks_batch, batch): index
+                for index, batch in enumerate(batches, start=1)
+            }
+
+            completed = 0
+            for future in concurrent.futures.as_completed(future_map):
+                batch_index = future_map[future]
+                try:
+                    results, missing = future.result()
+                    completed += len(results)
+                    print(
+                        f"YALCIN PRO - CACHE GRUP TAMAM: {batch_index}/{len(batches)} | "
+                        f"GELEN={len(results)} | EKSIK={len(missing)} | "
+                        f"CACHE={_cache_snapshot_count(normalized)}/{len(normalized)}"
+                    )
+                except Exception as e:
+                    print(
+                        f"YALCIN PRO - CACHE GRUP HATASI {batch_index}: {e}"
+                    )
+
+    finally:
+        _warm_running = False
+        final_count = _cache_snapshot_count(normalized)
+        print(
+            "YALCIN PRO - ARKA PLAN CACHE BITTI:",
+            final_count,
+            "/",
+            len(normalized),
+            "| ONCEDEN:",
+            total_before
+        )
+
+
+def _warm_cache_loop():
+    global _warm_running, _warm_thread, _warm_last_started
+
+    while True:
+        with _warm_lock:
+            symbols = list(_warm_symbols)
+
+        if not symbols:
+            _warm_running = False
+            return
+
+        _warm_last_started = time.time()
+        _warm_running = True
+        _warm_cache_once(symbols)
+
+        # Cache verisi stale olsa bile Android'e hazır veri dönsün;
+        # arka plan yenilemesi periyodik devam eder.
+        time.sleep(WARM_INTERVAL_SECONDS)
+
+
+def start_background_warm(symbols):
+    global _warm_thread, _warm_symbols, _warm_running
+
+    normalized = list(dict.fromkeys(
+        normalize_symbol(s) for s in symbols if normalize_symbol(s)
+    ))
+
+    if not normalized:
+        return
+
+    with _warm_lock:
+        _warm_symbols = normalized
+
+        if _warm_thread is not None and _warm_thread.is_alive():
+            print("YALCIN PRO - CACHE ISITMA ZATEN CALISIYOR")
+            return
+
+        _warm_thread = threading.Thread(
+            target=_warm_cache_loop,
+            name="yalcin-cache-warmer",
+            daemon=True
+        )
+        _warm_thread.start()
+
+        print(
+            "YALCIN PRO - CACHE ISITICI BASLATILDI:",
+            len(normalized),
+            "HISSE"
+        )
+
+
+# =============================================================
 # HEALTH
 # =============================================================
 
@@ -724,8 +847,9 @@ def single_stock(sembol):
 @app.route("/stocks/cache")
 def stocks_cache():
     """
-    Android için hazır cache'i döndürür.
-    Cache boşsa normal /stocks akışı kullanılabilir.
+    Android'a hazır cache'i döndürür.
+    Cache boş/eksikse Yahoo sorgusu burada BEKLETİLMEZ; arka plan ısıtıcısı
+    başlatılır ve mevcut veriler anında döndürülür.
     """
     symbols_text = request.args.get("symbols", "")
 
@@ -742,42 +866,38 @@ def stocks_cache():
         if s.strip()
     ))
 
+    # İlk Android isteği cache ısıtıcısına sembol evrenini öğretir.
+    start_background_warm(symbols)
+
     cached_results = []
     missing = []
 
     for symbol in symbols:
         cached = _cached_stock(symbol)
-
         if cached is not None:
             cached_results.append(cached)
         else:
             missing.append(symbol)
 
-    # Android sırasını koru
-    cache_map = {
-        item["sembol"]: item
-        for item in cached_results
-    }
-
-    ordered = [
-        cache_map[symbol]
-        for symbol in symbols
-        if symbol in cache_map
-    ]
+    cache_map = {item["sembol"]: item for item in cached_results}
+    ordered = [cache_map[symbol] for symbol in symbols if symbol in cache_map]
 
     print(
-        "YALCIN PRO - CACHE:",
+        "YALCIN PRO - CACHE CEVAP:",
         len(ordered),
         "/",
         len(symbols),
         "| EKSIK:",
-        len(missing)
+        len(missing),
+        "| ISITICI:",
+        "CALISIYOR" if _warm_running else "HAZIR"
     )
 
     return jsonify({
         "success": True,
         "cached": len(ordered),
         "missing": len(missing),
+        "warming": _warm_running,
         "data": ordered
     })
 
