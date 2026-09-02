@@ -20,7 +20,7 @@ MAX_WORKERS = 3
 MISSING_RETRY_COUNT = 3
 RETRY_WAIT_SECONDS = 1.0
 
-CACHE_TTL_SECONDS = 45
+CACHE_TTL_SECONDS = 30
 
 _stock_cache = {}
 _cache_lock = __import__("threading").Lock()
@@ -718,6 +718,71 @@ def single_stock(sembol):
 
 
 # =============================================================
+# HIZLI CACHE
+# =============================================================
+
+@app.route("/stocks/cache")
+def stocks_cache():
+    """
+    Android için hazır cache'i döndürür.
+    Cache boşsa normal /stocks akışı kullanılabilir.
+    """
+    symbols_text = request.args.get("symbols", "")
+
+    if not symbols_text:
+        return jsonify({
+            "success": False,
+            "error": "symbols parametresi gerekli",
+            "data": []
+        }), 400
+
+    symbols = list(dict.fromkeys(
+        normalize_symbol(s)
+        for s in symbols_text.split(",")
+        if s.strip()
+    ))
+
+    cached_results = []
+    missing = []
+
+    for symbol in symbols:
+        cached = _cached_stock(symbol)
+
+        if cached is not None:
+            cached_results.append(cached)
+        else:
+            missing.append(symbol)
+
+    # Android sırasını koru
+    cache_map = {
+        item["sembol"]: item
+        for item in cached_results
+    }
+
+    ordered = [
+        cache_map[symbol]
+        for symbol in symbols
+        if symbol in cache_map
+    ]
+
+    print(
+        "YALCIN PRO - CACHE:",
+        len(ordered),
+        "/",
+        len(symbols),
+        "| EKSIK:",
+        len(missing)
+    )
+
+    return jsonify({
+        "success": True,
+        "cached": len(ordered),
+        "missing": len(missing),
+        "data": ordered
+    })
+
+
+# =============================================================
 # TÜM HİSSELER
 # =============================================================
 
@@ -823,6 +888,12 @@ def stocks():
                 len(results)
             )
 
+            # Yahoo'yu yormamak için bekle
+            if batch_index < len(batches):
+
+                time.sleep(
+                    1.5
+                )
 
     except Exception as e:
 
