@@ -20,14 +20,28 @@ ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 # AYARLAR
 # =============================================================
 
-BATCH_SIZE = 25
-CACHE_TTL_SECONDS = 60
+# Bir Yahoo isteğinde işlenecek hisse sayısı
+BATCH_SIZE = 50
 
-BACKGROUND_REFRESH_SECONDS = 30
+# Cache'in taze kabul edileceği süre
+CACHE_TTL_SECONDS = 20
 
+# Bir yenileme turundan sonra tekrar başlama süresi
+BACKGROUND_REFRESH_SECONDS = 10
+
+# Başarısız gruplar için tekrar deneme
 RETRY_COUNT = 2
 RETRY_WAIT_SECONDS = 2
 
+# Yahoo intraday
+INTRADAY_PERIOD = "1d"
+INTRADAY_INTERVAL = "5m"
+
+# Önceki kapanışı bulmak için günlük veri
+DAILY_PERIOD = "5d"
+DAILY_INTERVAL = "1d"
+
+# Kalıcı cache
 PERSISTENT_CACHE_FILE = "yalcin_pro_cache.json"
 
 
@@ -36,9 +50,11 @@ PERSISTENT_CACHE_FILE = "yalcin_pro_cache.json"
 # =============================================================
 
 _stock_cache = {}
+
 _cache_lock = threading.Lock()
 
 _background_refresh_started = False
+
 _refresh_lock = threading.Lock()
 
 
@@ -61,7 +77,7 @@ def normalize_symbol(symbol):
 
 
 # =============================================================
-# KALICI CACHE YÜKLE
+# CACHE DOSYASINI YÜKLE
 # =============================================================
 
 def _load_persistent_cache():
@@ -71,9 +87,11 @@ def _load_persistent_cache():
     try:
 
         if not os.path.exists(PERSISTENT_CACHE_FILE):
+
             print(
                 "YALCIN PRO - KALICI CACHE DOSYASI YOK"
             )
+
             return
 
         with open(
@@ -84,28 +102,38 @@ def _load_persistent_cache():
 
             saved = json.load(f)
 
-        now = time.time()
-
         loaded = 0
 
         with _cache_lock:
 
             for symbol, item in saved.items():
 
-                if (
-                    isinstance(item, list)
-                    and len(item) == 2
-                    and isinstance(item[1], dict)
-                ):
+                try:
 
-                    _stock_cache[
-                        normalize_symbol(symbol)
-                    ] = (
-                        float(item[0]),
-                        item[1]
-                    )
+                    if (
+                        isinstance(item, list)
+                        and len(item) == 2
+                        and isinstance(item[1], dict)
+                    ):
 
-                    loaded += 1
+                        normalized = normalize_symbol(symbol)
+
+                        if not normalized:
+                            continue
+
+                        timestamp = float(item[0])
+
+                        result = item[1]
+
+                        _stock_cache[normalized] = (
+                            timestamp,
+                            result
+                        )
+
+                        loaded += 1
+
+                except Exception:
+                    continue
 
         print(
             "YALCIN PRO - KALICI CACHE YUKLENDI:",
@@ -122,7 +150,7 @@ def _load_persistent_cache():
 
 
 # =============================================================
-# KALICI CACHE KAYDET
+# CACHE DOSYASINI KAYDET
 # =============================================================
 
 def _save_persistent_cache():
@@ -179,6 +207,9 @@ def _save_persistent_cache():
 def _get_cache(symbol):
 
     symbol = normalize_symbol(symbol)
+
+    if not symbol:
+        return None, False
 
     now = time.time()
 
@@ -262,7 +293,9 @@ def _extract_close(
                 .get_level_values(1)
             )
 
+            # ---------------------------------------------
             # Ticker -> Close
+            # ---------------------------------------------
 
             if ticker_name in level0:
 
@@ -285,7 +318,9 @@ def _extract_close(
                         .dropna()
                     )
 
+            # ---------------------------------------------
             # Close -> Ticker
+            # ---------------------------------------------
 
             if (
                 "Close" in level0
@@ -374,7 +409,9 @@ def _make_result(
 
     previous = None
 
-    # 1 - günlük veri
+    # ---------------------------------------------------------
+    # 1 - Günlük veriden önceki kapanış
+    # ---------------------------------------------------------
 
     if previous_close is not None:
 
@@ -385,14 +422,15 @@ def _make_result(
             )
 
             if value > 0:
-
                 previous = value
 
         except Exception:
 
             previous = None
 
-    # 2 - intraday içinden önceki gün
+    # ---------------------------------------------------------
+    # 2 - Intraday içinden önceki gün
+    # ---------------------------------------------------------
 
     if previous is None:
 
@@ -432,11 +470,15 @@ def _make_result(
                             previous = value
 
         except Exception:
+
             previous = None
 
-    # 3 - son çare
+    # ---------------------------------------------------------
+    # 3 - Son çare
+    # ---------------------------------------------------------
 
     if previous is None:
+
         previous = price
 
     # =========================================================
@@ -466,7 +508,12 @@ def _make_result(
     # =========================================================
 
     if abs(change) < 0.000001:
+
         change = 0.0
+
+    # =========================================================
+    # SONUÇ
+    # =========================================================
 
     result = {
 
@@ -490,177 +537,11 @@ def _make_result(
         "paraBirimi": "TRY"
     }
 
-    print(
-        "YALCIN PRO - VERI:",
-        symbol,
-        "| FIYAT:",
-        result["fiyat"],
-        "| ONCEKI:",
-        result["oncekiKapanis"],
-        "| DEGISIM:",
-        result["degisimYuzde"]
-    )
-
     return result
 
 
 # =============================================================
-# TEK HİSSE - YAHOO
-# =============================================================
-
-def get_stock_from_yahoo(
-    symbol
-):
-
-    symbol = normalize_symbol(symbol)
-
-    if not symbol:
-        return None
-
-    ticker_name = (
-        symbol + ".IS"
-    )
-
-    try:
-
-        print(
-            "YALCIN PRO - YAHOO:",
-            ticker_name
-        )
-
-        # =====================================================
-        # INTRADAY
-        # =====================================================
-
-        intraday = yf.download(
-
-            tickers=ticker_name,
-
-            period="1d",
-
-            interval="5m",
-
-            auto_adjust=False,
-
-            prepost=False,
-
-            threads=False,
-
-            progress=False
-        )
-
-        closes = _extract_close(
-            intraday,
-            ticker_name
-        )
-
-        # =====================================================
-        # GÜNLÜK
-        # =====================================================
-
-        daily = yf.download(
-
-            tickers=ticker_name,
-
-            period="5d",
-
-            interval="1d",
-
-            auto_adjust=False,
-
-            prepost=False,
-
-            threads=False,
-
-            progress=False
-        )
-
-        daily_closes = _extract_close(
-            daily,
-            ticker_name
-        )
-
-        # =====================================================
-        # INTRADAY YOKSA GÜNLÜK KULLAN
-        # =====================================================
-
-        if (
-            closes is None
-            or closes.empty
-        ):
-
-            closes = daily_closes
-
-        if (
-            closes is None
-            or closes.empty
-        ):
-
-            print(
-                "YALCIN PRO - VERI YOK:",
-                symbol
-            )
-
-            return None
-
-        # =====================================================
-        # ÖNCEKİ KAPANIŞ
-        # =====================================================
-
-        previous_close = None
-
-        if (
-            daily_closes is not None
-            and
-            not daily_closes.empty
-        ):
-
-            daily_closes = (
-                daily_closes
-                .dropna()
-            )
-
-            if len(daily_closes) >= 2:
-
-                try:
-
-                    previous_close = float(
-                        daily_closes.iloc[-2]
-                    )
-
-                    if previous_close <= 0:
-                        previous_close = None
-
-                except Exception:
-
-                    previous_close = None
-
-        # =====================================================
-        # SONUÇ
-        # =====================================================
-
-        return _make_result(
-
-            symbol,
-
-            closes,
-
-            previous_close
-        )
-
-    except Exception as e:
-
-        print(
-            "YALCIN PRO - YAHOO HATASI:",
-            symbol,
-            e
-        )
-
-        return None
-
-
-# =============================================================
-# TOPLU HİSSELER
+# TOPLU HİSSELER - YAHOO
 # =============================================================
 
 def get_stocks_batch(
@@ -678,9 +559,11 @@ def get_stocks_batch(
     )
 
     if not symbols:
+
         return [], []
 
     results = []
+
     missing = []
 
     tickers = [
@@ -704,9 +587,9 @@ def get_stocks_batch(
 
             tickers=tickers,
 
-            period="1d",
+            period=INTRADAY_PERIOD,
 
-            interval="5m",
+            interval=INTRADAY_INTERVAL,
 
             group_by="ticker",
 
@@ -714,7 +597,7 @@ def get_stocks_batch(
 
             prepost=False,
 
-            threads=False,
+            threads=True,
 
             progress=False
         )
@@ -727,9 +610,9 @@ def get_stocks_batch(
 
             tickers=tickers,
 
-            period="5d",
+            period=DAILY_PERIOD,
 
-            interval="1d",
+            interval=DAILY_INTERVAL,
 
             group_by="ticker",
 
@@ -737,7 +620,7 @@ def get_stocks_batch(
 
             prepost=False,
 
-            threads=False,
+            threads=True,
 
             progress=False
         )
@@ -790,11 +673,6 @@ def get_stocks_batch(
                         symbol
                     )
 
-                    print(
-                        "YALCIN PRO - EKSIK:",
-                        symbol
-                    )
-
                     continue
 
                 # -------------------------------------------------
@@ -830,6 +708,7 @@ def get_stocks_batch(
                             )
 
                             if value > 0:
+
                                 previous_close = value
 
                         except Exception:
@@ -864,7 +743,7 @@ def get_stocks_batch(
             except Exception as e:
 
                 print(
-                    "YALCIN PRO - HİSSE HATASI:",
+                    "YALCIN PRO - HISSE HATASI:",
                     symbol,
                     e
                 )
@@ -881,6 +760,15 @@ def get_stocks_batch(
         )
 
         return [], list(symbols)
+
+    print(
+        "YALCIN PRO - GRUP SONUCU:",
+        len(results),
+        "/",
+        len(symbols),
+        "| EKSIK:",
+        len(missing)
+    )
 
     return results, missing
 
@@ -912,11 +800,14 @@ def start_background_refresh(
     with _refresh_lock:
 
         if _background_refresh_started:
+
             return
 
         _background_refresh_started = True
 
     def worker():
+
+        global _background_refresh_started
 
         print(
             "YALCIN PRO - ARKA PLAN BASLADI:",
@@ -927,6 +818,10 @@ def start_background_refresh(
         while True:
 
             try:
+
+                # =================================================
+                # GRUPLARI OLUŞTUR
+                # =================================================
 
                 batches = [
 
@@ -941,11 +836,17 @@ def start_background_refresh(
 
                 total_updated = 0
 
+                total_missing = 0
+
                 print(
                     "YALCIN PRO - YENILEME TURU:",
                     len(batches),
                     "GRUP"
                 )
+
+                # =================================================
+                # HER GRUP
+                # =================================================
 
                 for index, batch in enumerate(
                     batches,
@@ -964,6 +865,12 @@ def start_background_refresh(
 
                     success = False
 
+                    last_missing = list(batch)
+
+                    # =================================================
+                    # RETRY
+                    # =================================================
+
                     for retry in range(
                         RETRY_COUNT + 1
                     ):
@@ -975,6 +882,10 @@ def start_background_refresh(
                                     batch
                                 )
                             )
+
+                            # -----------------------------------------
+                            # BAŞARILI VERİLER CACHE
+                            # -----------------------------------------
 
                             for result in results:
 
@@ -992,8 +903,14 @@ def start_background_refresh(
                                         result
                                     )
 
-                            total_updated += (
-                                len(results)
+                            total_updated += len(
+                                results
+                            )
+
+                            last_missing = missing
+
+                            total_missing += len(
+                                missing
                             )
 
                             success = True
@@ -1004,7 +921,9 @@ def start_background_refresh(
                                 "| GUNCEL:",
                                 len(results),
                                 "| EKSIK:",
-                                len(missing)
+                                len(missing),
+                                "| DENEME:",
+                                retry + 1
                             )
 
                             break
@@ -1014,6 +933,8 @@ def start_background_refresh(
                             print(
                                 "YALCIN PRO - GRUP HATASI:",
                                 index,
+                                "| DENEME:",
+                                retry + 1,
                                 e
                             )
 
@@ -1023,9 +944,21 @@ def start_background_refresh(
                                     RETRY_WAIT_SECONDS
                                 )
 
-                    # Gruplar arasında bekle
+                    # =================================================
+                    # BAŞARISIZSA ESKİ CACHE KORUNUR
+                    # =================================================
 
-                    time.sleep(1)
+                    if not success:
+
+                        print(
+                            "YALCIN PRO - GRUP BASARISIZ:",
+                            index,
+                            "| HISSE:",
+                            len(batch)
+                        )
+
+                    # Gruplar arasında kısa bekleme
+                    time.sleep(0.5)
 
                 # =================================================
                 # CACHE DOSYASINI TEK SEFERDE KAYDET
@@ -1033,12 +966,30 @@ def start_background_refresh(
 
                 _save_persistent_cache()
 
+                # =================================================
+                # CACHE DURUMU
+                # =================================================
+
+                with _cache_lock:
+
+                    cache_count = len(
+                        _stock_cache
+                    )
+
                 print(
                     "YALCIN PRO - YENILEME TAMAMLANDI:",
                     total_updated,
                     "/",
-                    len(refresh_symbols)
+                    len(refresh_symbols),
+                    "| CACHE:",
+                    cache_count,
+                    "| EKSIK:",
+                    total_missing
                 )
+
+                # =================================================
+                # SONRAKİ TUR
+                # =================================================
 
                 time.sleep(
                     BACKGROUND_REFRESH_SECONDS
@@ -1080,6 +1031,7 @@ _load_persistent_cache()
 def health():
 
     with _cache_lock:
+
         cache_count = len(
             _stock_cache
         )
@@ -1093,6 +1045,7 @@ def health():
         "cache": cache_count,
 
         "serverTime": datetime_now()
+
     })
 
 
@@ -1130,6 +1083,7 @@ def single_stock(
             "success": False,
 
             "data": []
+
         }), 400
 
     result, fresh = _get_cache(
@@ -1149,6 +1103,7 @@ def single_stock(
             "data": [
                 result
             ]
+
         })
 
     # =========================================================
@@ -1157,29 +1112,43 @@ def single_stock(
 
     def update_one():
 
-        new_result = (
-            get_stock_from_yahoo(
-                symbol
+        try:
+
+            new_result = (
+                get_stock_from_yahoo(
+                    symbol
+                )
             )
-        )
 
-        if new_result:
+            if new_result:
 
-            _save_stock_memory(
+                _save_stock_memory(
+                    symbol,
+                    new_result
+                )
+
+                _save_persistent_cache()
+
+        except Exception as e:
+
+            print(
+                "YALCIN PRO - TEK HISSE GUNCELLEME HATASI:",
                 symbol,
-                new_result
+                e
             )
-
-            _save_persistent_cache()
 
     thread = threading.Thread(
+
         target=update_one,
+
         daemon=True
     )
 
     thread.start()
 
-    # Eski veri varsa hemen gönder
+    # =========================================================
+    # ESKİ VERİ VARSA HEMEN GÖNDER
+    # =========================================================
 
     if result is not None:
 
@@ -1190,16 +1159,178 @@ def single_stock(
             "data": [
                 result
             ]
+
         })
 
-    # Veri yoksa
+    # =========================================================
+    # VERİ YOKSA
+    # =========================================================
 
     return jsonify({
 
         "success": True,
 
         "data": []
+
     })
+
+
+# =============================================================
+# TEK HİSSE - YAHOO
+# =============================================================
+
+def get_stock_from_yahoo(
+    symbol
+):
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+    if not symbol:
+        return None
+
+    ticker_name = (
+        symbol + ".IS"
+    )
+
+    try:
+
+        print(
+            "YALCIN PRO - TEK YAHOO:",
+            ticker_name
+        )
+
+        # =====================================================
+        # INTRADAY
+        # =====================================================
+
+        intraday = yf.download(
+
+            tickers=ticker_name,
+
+            period=INTRADAY_PERIOD,
+
+            interval=INTRADAY_INTERVAL,
+
+            auto_adjust=False,
+
+            prepost=False,
+
+            threads=False,
+
+            progress=False
+        )
+
+        closes = _extract_close(
+            intraday,
+            ticker_name
+        )
+
+        # =====================================================
+        # GÜNLÜK
+        # =====================================================
+
+        daily = yf.download(
+
+            tickers=ticker_name,
+
+            period=DAILY_PERIOD,
+
+            interval=DAILY_INTERVAL,
+
+            auto_adjust=False,
+
+            prepost=False,
+
+            threads=False,
+
+            progress=False
+        )
+
+        daily_closes = _extract_close(
+            daily,
+            ticker_name
+        )
+
+        # =====================================================
+        # INTRADAY YOKSA GÜNLÜK
+        # =====================================================
+
+        if (
+            closes is None
+            or closes.empty
+        ):
+
+            closes = daily_closes
+
+        if (
+            closes is None
+            or closes.empty
+        ):
+
+            print(
+                "YALCIN PRO - VERI YOK:",
+                symbol
+            )
+
+            return None
+
+        # =====================================================
+        # ÖNCEKİ KAPANIŞ
+        # =====================================================
+
+        previous_close = None
+
+        if (
+            daily_closes is not None
+            and
+            not daily_closes.empty
+        ):
+
+            daily_closes = (
+                daily_closes
+                .dropna()
+            )
+
+            if len(daily_closes) >= 2:
+
+                try:
+
+                    previous_close = float(
+                        daily_closes.iloc[-2]
+                    )
+
+                    if previous_close <= 0:
+
+                        previous_close = None
+
+                except Exception:
+
+                    previous_close = None
+
+        # =====================================================
+        # SONUÇ
+        # =====================================================
+
+        return _make_result(
+
+            symbol,
+
+            closes,
+
+            previous_close
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - YAHOO HATASI:",
+            symbol,
+            e
+        )
+
+        return None
 
 
 # =============================================================
@@ -1225,6 +1356,7 @@ def stocks():
             ),
 
             "data": []
+
         }), 400
 
     # =========================================================
@@ -1238,6 +1370,7 @@ def stocks():
         for s in symbols_text.split(",")
 
         if s.strip()
+
     ]
 
     symbols = list(
@@ -1255,7 +1388,7 @@ def stocks():
     )
 
     # =========================================================
-    # ARKA PLAN YENİLEMEYİ BAŞLAT
+    # ARKA PLAN YENİLEME
     # =========================================================
 
     start_background_refresh(
@@ -1269,6 +1402,7 @@ def stocks():
     result_map = {}
 
     fresh_count = 0
+
     stale_count = 0
 
     with _cache_lock:
@@ -1300,23 +1434,6 @@ def stocks():
                 stale_count += 1
 
     # =========================================================
-    # ESKİ CACHE OLAN HİSSELERİ ARKA PLAN YENİLEYECEK
-    # =========================================================
-
-    print(
-        "YALCIN PRO - CACHE:",
-        len(result_map),
-        "/",
-        len(symbols),
-
-        "| TAZE:",
-        fresh_count,
-
-        "| ESKI:",
-        stale_count
-    )
-
-    # =========================================================
     # ANDROID SIRASINI KORU
     # =========================================================
 
@@ -1327,10 +1444,11 @@ def stocks():
         for symbol in symbols
 
         if symbol in result_map
+
     ]
 
     # =========================================================
-    # VERİSİ OLMAYANLAR
+    # EKSİKLER
     # =========================================================
 
     missing = [
@@ -1340,7 +1458,28 @@ def stocks():
         for symbol in symbols
 
         if symbol not in result_map
+
     ]
+
+    print(
+        "YALCIN PRO - CACHE:",
+        len(result_map),
+        "/",
+        len(symbols),
+        "| TAZE:",
+        fresh_count,
+        "| ESKI:",
+        stale_count,
+        "| EKSIK:",
+        len(missing)
+    )
+
+    if missing:
+
+        print(
+            "YALCIN PRO - VERISI OLMAYAN:",
+            ", ".join(missing[:50])
+        )
 
     print(
         "YALCIN PRO - CEVAP:",
@@ -1348,13 +1487,6 @@ def stocks():
         "/",
         len(symbols)
     )
-
-    if missing:
-
-        print(
-            "YALCIN PRO - VERISI OLMAYAN:",
-            len(missing)
-        )
 
     print(
         "================================================="
@@ -1369,6 +1501,7 @@ def stocks():
         "success": True,
 
         "data": ordered_results
+
     })
 
 
@@ -1405,7 +1538,19 @@ if __name__ == "__main__":
     print(
         "CANLI YENILEME:",
         BACKGROUND_REFRESH_SECONDS,
-        "SANİYE"
+        "SANIYE"
+    )
+
+    print(
+        "CACHE TTL:",
+        CACHE_TTL_SECONDS,
+        "SANIYE"
+    )
+
+    print(
+        "BATCH:",
+        BATCH_SIZE,
+        "HISSE"
     )
 
     print(
