@@ -1264,8 +1264,7 @@ def get_stocks_batch(
 # TEK HİSSE - YAHOO
 # =============================================================
 
-
-
+def get_stock_from_yahoo(
     symbol
 ):
 
