@@ -24,19 +24,19 @@ ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 # =============================================================
 
 # Yahoo bir istekte kaç hisse işleyecek
-BATCH_SIZE = 50
+BATCH_SIZE = 25
 
 # Cache kaç saniye taze kabul edilecek
 CACHE_TTL_SECONDS = 20
 
 # Bir yenileme turundan sonra bekleme
-BACKGROUND_REFRESH_SECONDS = 10
+BACKGROUND_REFRESH_SECONDS = 30
 
 # Başarısız gruplar için tekrar deneme
-RETRY_COUNT = 2
+RETRY_COUNT = 1
 
 # Retry arası bekleme
-RETRY_WAIT_SECONDS = 2
+RETRY_WAIT_SECONDS = 3
 
 # Yahoo intraday
 INTRADAY_PERIOD = "1d"
@@ -57,7 +57,14 @@ KAP_BIST_URL = "https://kap.org.tr/tr/bist-sirketler"
 
 # KAP BIST şirket sayısı için güvenlik sınırı.
 # Liste bu sınırı aşarsa HTML parser tekrar kontrol edilmeden kullanılmaz.
-MAX_KAP_SYMBOLS = 900
+MAX_KAP_SYMBOLS = 1200
+
+# KAP listesinin içine zaman zaman karışabilen denetim kuruluşu
+# ve şirket dışı kodlar. Bunlar Yahoo'da BIST hissesi değildir.
+INVALID_SYMBOLS = {
+    "DRT", "PWC", "KPMG", "TTK", "BDO", "PKF",
+    "RSM", "BD", "CNS", "HSY", "KARAR", "REFORM"
+}
 
 
 # =============================================================
@@ -91,13 +98,18 @@ def normalize_symbol(symbol):
     if not symbol:
         return ""
 
-    return (
+    normalized = (
         str(symbol)
         .strip()
         .upper()
         .replace(".IS", "")
         .replace(" ", "")
     )
+
+    if normalized in INVALID_SYMBOLS:
+        return ""
+
+    return normalized
 
 
 # =============================================================
@@ -248,7 +260,11 @@ class KAPSymbolParser(HTMLParser):
                 )
 
                 # Tablo başlığının yanlışlıkla sembol olmasını engelle.
-                if candidate and candidate != "KOD":
+                if (
+                    candidate
+                    and candidate != "KOD"
+                    and candidate not in INVALID_SYMBOLS
+                ):
 
                     self.symbols.append(
                         candidate
@@ -400,7 +416,7 @@ def _load_symbol_cache():
                 symbol
             )
 
-            if normalized:
+            if normalized and normalized not in INVALID_SYMBOLS:
 
                 cleaned.append(
                     normalized
@@ -411,13 +427,8 @@ def _load_symbol_cache():
         # Eski sürümde KAP'ın denetim kuruluşları da sembol olarak
         # cache'e girmiş olabilir (ör. DRT, PWC). Böyle bir cache'i
         # kullanma; yeni KAP listesini yeniden oluştur.
-        invalid_codes = {
-            "DRT", "PWC", "KPMG", "TTK", "BDO", "PKF",
-            "RSM", "BD", "CNS", "HSY", "KARAR", "REFORM"
-        }
-
-        if len(cleaned) > 800 or any(
-            code in invalid_codes for code in cleaned
+        if len(cleaned) > MAX_KAP_SYMBOLS or any(
+            code in INVALID_SYMBOLS for code in cleaned
         ):
             print(
                 "YALCIN PRO - ESKI/GEÇERSIZ SEMBOL CACHE ATILDI:",
@@ -468,7 +479,7 @@ def _save_symbol_cache(
                 symbol
             )
 
-            if normalized:
+            if normalized and normalized not in INVALID_SYMBOLS:
 
                 cleaned.append(
                     normalized
@@ -1088,35 +1099,24 @@ def get_stocks_batch(
 ):
 
     symbols = [
-
         normalize_symbol(s)
-
         for s in symbols
-
         if normalize_symbol(s)
-
     ]
 
     symbols = list(
-        dict.fromkeys(
-            symbols
-        )
+        dict.fromkeys(symbols)
     )
 
     if not symbols:
-
         return [], []
 
     results = []
-
     missing = []
 
     tickers = [
-
         symbol + ".IS"
-
         for symbol in symbols
-
     ]
 
     try:
@@ -1132,23 +1132,14 @@ def get_stocks_batch(
         # -----------------------------------------------------
 
         intraday_data = yf.download(
-
             tickers=tickers,
-
             period=INTRADAY_PERIOD,
-
             interval=INTRADAY_INTERVAL,
-
             group_by="ticker",
-
             auto_adjust=False,
-
             prepost=False,
-
             threads=True,
-
             progress=False
-
         )
 
         # -----------------------------------------------------
@@ -1156,23 +1147,14 @@ def get_stocks_batch(
         # -----------------------------------------------------
 
         daily_data = yf.download(
-
             tickers=tickers,
-
             period=DAILY_PERIOD,
-
             interval=DAILY_INTERVAL,
-
             group_by="ticker",
-
             auto_adjust=False,
-
             prepost=False,
-
             threads=True,
-
             progress=False
-
         )
 
         # -----------------------------------------------------
@@ -1181,81 +1163,48 @@ def get_stocks_batch(
 
         for symbol in symbols:
 
-            ticker_name = (
-                symbol + ".IS"
-            )
+            ticker_name = symbol + ".IS"
 
             try:
 
-                # -------------------------------------------------
-                # INTRADAY
-                # -------------------------------------------------
-
                 closes = _extract_close(
-
                     intraday_data,
-
                     ticker_name
-
                 )
-
-                # -------------------------------------------------
-                # GÜNLÜK SON ÇARE
-                # -------------------------------------------------
 
                 if (
                     closes is None
-                    or
-                    closes.empty
+                    or closes.empty
                 ):
 
                     closes = _extract_close(
-
                         daily_data,
-
                         ticker_name
-
                     )
 
                 if (
                     closes is None
-                    or
-                    closes.empty
+                    or closes.empty
                 ):
 
-                    missing.append(
-                        symbol
-                    )
-
+                    missing.append(symbol)
                     continue
 
-                # -------------------------------------------------
-                # ÖNCEKİ KAPANIŞ
-                # -------------------------------------------------
-
-                daily_closes = (
-                    _extract_close(
-                        daily_data,
-                        ticker_name
-                    )
+                daily_closes = _extract_close(
+                    daily_data,
+                    ticker_name
                 )
 
                 previous_close = None
 
                 if (
                     daily_closes is not None
-                    and
-                    not daily_closes.empty
+                    and not daily_closes.empty
                 ):
 
-                    daily_closes = (
-                        daily_closes
-                        .dropna()
-                    )
+                    daily_closes = daily_closes.dropna()
 
-                    if len(
-                        daily_closes
-                    ) >= 2:
+                    if len(daily_closes) >= 2:
 
                         try:
 
@@ -1264,40 +1213,21 @@ def get_stocks_batch(
                             )
 
                             if value > 0:
-
-                                previous_close = (
-                                    value
-                                )
+                                previous_close = value
 
                         except Exception:
-
                             previous_close = None
 
-                # -------------------------------------------------
-                # SONUÇ
-                # -------------------------------------------------
-
                 result = _make_result(
-
                     symbol,
-
                     closes,
-
                     previous_close
-
                 )
 
                 if result:
-
-                    results.append(
-                        result
-                    )
-
+                    results.append(result)
                 else:
-
-                    missing.append(
-                        symbol
-                    )
+                    missing.append(symbol)
 
             except Exception as e:
 
@@ -1307,9 +1237,7 @@ def get_stocks_batch(
                     e
                 )
 
-                missing.append(
-                    symbol
-                )
+                missing.append(symbol)
 
     except Exception as e:
 
@@ -1318,9 +1246,7 @@ def get_stocks_batch(
             e
         )
 
-        return [], list(
-            symbols
-        )
+        return [], list(symbols)
 
     print(
         "YALCIN PRO - GRUP SONUCU:",
@@ -1338,7 +1264,8 @@ def get_stocks_batch(
 # TEK HİSSE - YAHOO
 # =============================================================
 
-def get_stock_from_yahoo(
+
+
     symbol
 ):
 
