@@ -55,6 +55,10 @@ SYMBOL_CACHE_FILE = "yalcin_pro_symbols.json"
 # KAP BIST şirketleri
 KAP_BIST_URL = "https://kap.org.tr/tr/bist-sirketler"
 
+# KAP BIST şirket sayısı için güvenlik sınırı.
+# Liste bu sınırı aşarsa HTML parser tekrar kontrol edilmeden kullanılmaz.
+MAX_KAP_SYMBOLS = 900
+
 
 # =============================================================
 # CACHE
@@ -146,54 +150,115 @@ def normalize_kap_symbol(symbol):
 # =============================================================
 
 class KAPSymbolParser(HTMLParser):
+    """
+    KAP BIST şirketleri tablosundan SADECE ilk sütundaki
+    hisse kodunu alır.
+
+    ÖNEMLİ:
+    KAP satırlarında şirket kodunun yanında şirket unvanı, şehir
+    ve bağımsız denetim kuruluşu da bulunabilir. Eski parser
+    link metinlerini taradığı için DRT, PWC, TTK, PKF gibi denetim
+    kuruluşlarını da hisse sembolü sanabiliyordu.
+
+    Bu parser sadece <tr> içindeki ilk <td>/<th> hücresini okur
+    ve o hücredeki İLK geçerli kodu sembol olarak kabul eder.
+    Böylece ikinci kodlar ve denetim kuruluşları listeye girmez.
+    """
+
     def __init__(self):
         super().__init__()
-        self.in_link = False
-        self.current_text = []
+
+        self.in_row = False
+        self.in_cell = False
+        self.cell_index = -1
+        self.current_cell_text = []
+        self.first_cell_text = ""
         self.symbols = []
 
     def handle_starttag(self, tag, attrs):
-        if tag.lower() != "a":
+
+        tag = tag.lower()
+
+        if tag == "tr":
+
+            self.in_row = True
+            self.in_cell = False
+            self.cell_index = -1
+            self.current_cell_text = []
+            self.first_cell_text = ""
+
             return
-        href = ""
-        for key, value in attrs:
-            if key.lower() == "href":
-                href = value or ""
-                break
-        if "/tr/sirket-bilgileri/" in href.lower():
-            self.in_link = True
-            self.current_text = []
+
+        if (
+            self.in_row
+            and tag in ("td", "th")
+        ):
+
+            self.cell_index += 1
+            self.in_cell = True
+            self.current_cell_text = []
 
     def handle_data(self, data):
-        if self.in_link:
-            self.current_text.append(data)
+
+        if self.in_row and self.in_cell:
+
+            self.current_cell_text.append(data)
 
     def handle_endtag(self, tag):
-        if tag.lower() != "a" or not self.in_link:
+
+        tag = tag.lower()
+
+        if (
+            self.in_row
+            and self.in_cell
+            and tag in ("td", "th")
+        ):
+
+            if self.cell_index == 0:
+
+                self.first_cell_text = (
+                    " ".join(
+                        self.current_cell_text
+                    )
+                    .strip()
+                )
+
+            self.in_cell = False
+            self.current_cell_text = []
+
             return
 
-        text = " ".join(self.current_text).strip()
-        self.in_link = False
-        self.current_text = []
-
-        if not text:
+        if tag != "tr" or not self.in_row:
             return
 
-        # KAP'ta hisse kodu linki ile bağımsız denetim
-        # kuruluşu linki aynı URL yapısını kullanabiliyor.
-        # Bu nedenle sadece 1-2 adet saf kod içeren linkleri al.
-        tokens = re.findall(r"[A-Z0-9]{2,8}", text.upper())
+        raw_code = self.first_cell_text.strip()
 
-        if not tokens or len(tokens) > 2:
-            return
+        if raw_code:
 
-        normalized_tokens = [
-            normalize_kap_symbol(token)
-            for token in tokens
-        ]
+            tokens = re.findall(
+                r"[A-Z0-9]{2,8}",
+                raw_code.upper()
+            )
 
-        if all(normalized_tokens):
-            self.symbols.extend(normalized_tokens)
+            if tokens:
+
+                # İlk sütundaki ilk kod = ana BIST sembolü.
+                candidate = normalize_kap_symbol(
+                    tokens[0]
+                )
+
+                # Tablo başlığının yanlışlıkla sembol olmasını engelle.
+                if candidate and candidate != "KOD":
+
+                    self.symbols.append(
+                        candidate
+                    )
+
+        self.in_row = False
+        self.in_cell = False
+        self.cell_index = -1
+        self.current_cell_text = []
+        self.first_cell_text = ""
 
 
 # =============================================================
@@ -258,6 +323,18 @@ def _download_kap_symbols():
             print(
                 "YALCIN PRO - KAP SEMBOL LISTESI YETERSIZ:",
                 len(symbols)
+            )
+
+            return []
+
+        # Aşırı büyük liste genellikle KAP HTML yapısının yanlış
+        # parse edildiğini gösterir. Eski sürüm 1045 sembol üretiyordu.
+        if len(symbols) > MAX_KAP_SYMBOLS:
+
+            print(
+                "YALCIN PRO - KAP SEMBOL LISTESI SUPHELI:",
+                len(symbols),
+                "HISSE"
             )
 
             return []
@@ -347,6 +424,13 @@ def _load_symbol_cache():
                 len(cleaned),
                 "HISSE"
             )
+
+            # Eski hatalı cache'in tekrar kullanılmasını engelle.
+            try:
+                os.remove(SYMBOL_CACHE_FILE)
+            except Exception:
+                pass
+
             return
 
         with _symbol_list_lock:
