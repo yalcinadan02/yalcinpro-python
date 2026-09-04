@@ -2,6 +2,7 @@ from flask import Flask, jsonify, request
 import yfinance as yf
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import json
 import re
@@ -32,6 +33,12 @@ CACHE_TTL_SECONDS = 20
 # Bir yenileme turundan sonra bekleme
 BACKGROUND_REFRESH_SECONDS = 30
 
+# KAP sembol listesini ne kadar sıklıkla yeniden kontrol edeceğiz
+SYMBOL_REFRESH_SECONDS = 300
+
+# İlk geçerli evren için güvenli paralel Yahoo işçisi sayısı
+SYMBOL_DISCOVERY_WORKERS = 4
+
 # Başarısız gruplar için tekrar deneme
 RETRY_COUNT = 1
 
@@ -51,6 +58,9 @@ PERSISTENT_CACHE_FILE = "yalcin_pro_cache.json"
 
 # Dinamik sembol cache
 SYMBOL_CACHE_FILE = "yalcin_pro_symbols.json"
+
+# Yahoo'dan doğrulanmış aktif BIST hisseleri
+ACTIVE_SYMBOL_CACHE_FILE = "yalcin_pro_active_symbols.json"
 
 # KAP BIST şirketleri
 KAP_BIST_URL = "https://kap.org.tr/tr/bist-sirketler"
@@ -87,6 +97,9 @@ _refresh_lock = threading.Lock()
 _symbol_list = []
 
 _symbol_list_lock = threading.Lock()
+
+_last_symbol_refresh = 0.0
+_symbol_refresh_lock = threading.Lock()
 
 
 # =============================================================
@@ -531,36 +544,248 @@ def _save_symbol_cache(
 # BIST SEMBOLLERİNİ GETİR
 # =============================================================
 
-def get_bist_symbols():
+def _load_active_symbol_cache():
+    """Yahoo'dan daha önce doğrulanmış aktif BIST evrenini yükler."""
     global _symbol_list
 
-    # Önce RAM'de doğrulanmış liste varsa kullan.
-    with _symbol_list_lock:
-        current = list(_symbol_list)
+    try:
+        if not os.path.exists(ACTIVE_SYMBOL_CACHE_FILE):
+            return []
 
-    if current:
-        return current
+        with open(ACTIVE_SYMBOL_CACHE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
 
-    # Önce KAP'tan güncel BIST listesini al.
-    # Böylece eski/hatalı sembol cache'i yeni listeyi bozmaz.
-    fresh_symbols = _download_kap_symbols()
+        if not isinstance(saved, list):
+            return []
 
-    if fresh_symbols:
+        cleaned = list(dict.fromkeys(
+            normalize_symbol(s)
+            for s in saved
+            if normalize_symbol(s)
+        ))
+
+        if not cleaned:
+            return []
+
         with _symbol_list_lock:
-            _symbol_list = fresh_symbols
-        _save_symbol_cache(fresh_symbols)
-        return fresh_symbols
+            _symbol_list = cleaned
 
-    # KAP erişilemezse doğrulanmış dosya cache'ini kullan.
-    _load_symbol_cache()
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE YUKLENDI:",
+            len(cleaned),
+            "HISSE"
+        )
 
+        return cleaned
+
+    except Exception as e:
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE HATASI:",
+            e
+        )
+        return []
+
+
+def _save_active_symbol_cache(symbols):
+    """Doğrulanmış aktif sembolleri atomik olarak kaydeder."""
+    try:
+        cleaned = list(dict.fromkeys(
+            normalize_symbol(s)
+            for s in symbols
+            if normalize_symbol(s)
+        ))
+
+        temp_file = ACTIVE_SYMBOL_CACHE_FILE + ".tmp"
+
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(
+                cleaned,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        os.replace(temp_file, ACTIVE_SYMBOL_CACHE_FILE)
+
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE KAYDEDILDI:",
+            len(cleaned),
+            "HISSE"
+        )
+
+    except Exception as e:
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE YAZMA HATASI:",
+            e
+        )
+
+
+def _discover_active_symbols_from_kap(kap_symbols):
+    """
+    KAP listesindeki sembolleri Yahoo'dan doğrular.
+    Böylece KAP'taki yatırım/borçlanma/işlem görmeyen benzeri kayıtlar
+    aktif hisse evrenine girmez.
+
+    Başlangıçtaki doğrulanmış evrenin yaklaşık 741 olması beklenir;
+    sayı sabitlenmez. Yeni şirketler eklendiğinde sonraki keşifte otomatik
+    olarak dahil edilir.
+    """
+    candidates = list(dict.fromkeys(
+        normalize_symbol(s)
+        for s in kap_symbols
+        if normalize_symbol(s)
+    ))
+
+    if not candidates:
+        return []
+
+    batches = [
+        candidates[i:i + BATCH_SIZE]
+        for i in range(0, len(candidates), BATCH_SIZE)
+    ]
+
+    active = set()
+
+    print(
+        "YALCIN PRO - SEMBOL DOGRULAMA:",
+        len(candidates),
+        "ADAY |",
+        len(batches),
+        "GRUP |",
+        SYMBOL_DISCOVERY_WORKERS,
+        "ISCI"
+    )
+
+    def check_batch(batch):
+        try:
+            results, missing = get_stocks_batch(batch)
+            return [
+                normalize_symbol(item.get("sembol", ""))
+                for item in results
+                if normalize_symbol(item.get("sembol", ""))
+            ]
+        except Exception as e:
+            print(
+                "YALCIN PRO - SEMBOL DOGRULAMA GRUP HATASI:",
+                e
+            )
+            return []
+
+    with ThreadPoolExecutor(
+        max_workers=SYMBOL_DISCOVERY_WORKERS,
+        thread_name_prefix="yalcin-symbol"
+    ) as executor:
+
+        futures = {
+            executor.submit(check_batch, batch): index
+            for index, batch in enumerate(batches, start=1)
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+            completed += 1
+            index = futures[future]
+
+            try:
+                valid = future.result()
+                active.update(valid)
+                print(
+                    "YALCIN PRO - SEMBOL DOGRULAMA:",
+                    completed,
+                    "/",
+                    len(batches),
+                    "| GRUP:",
+                    index,
+                    "| AKTIF:",
+                    len(active)
+                )
+            except Exception as e:
+                print(
+                    "YALCIN PRO - SEMBOL FUTURE HATASI:",
+                    index,
+                    e
+                )
+
+    # KAP sırasını koru; set sırası kullanma.
+    ordered = [
+        symbol
+        for symbol in candidates
+        if symbol in active
+    ]
+
+    print(
+        "YALCIN PRO - AKTIF BIST EVRENI:",
+        len(ordered),
+        "HISSE"
+    )
+
+    return ordered
+
+
+def _refresh_symbol_universe(force=False):
+    """KAP listesini periyodik olarak yeniden alır ve Yahoo ile doğrular."""
+    global _last_symbol_refresh, _symbol_list
+
+    now = time.time()
+
+    with _symbol_refresh_lock:
+        if (
+            not force
+            and _last_symbol_refresh > 0
+            and now - _last_symbol_refresh < SYMBOL_REFRESH_SECONDS
+        ):
+            with _symbol_list_lock:
+                return list(_symbol_list)
+
+        # Başka bir istek keşif yapıyorsa ikinci kez yapma.
+        _last_symbol_refresh = now
+
+    kap_symbols = _download_kap_symbols()
+
+    if not kap_symbols:
+        with _symbol_list_lock:
+            return list(_symbol_list)
+
+    active = _discover_active_symbols_from_kap(kap_symbols)
+
+    if not active:
+        with _symbol_list_lock:
+            return list(_symbol_list)
+
+    with _symbol_list_lock:
+        old = list(_symbol_list)
+        _symbol_list = active
+
+    _save_active_symbol_cache(active)
+    _save_symbol_cache(kap_symbols)
+
+    added = [s for s in active if s not in old]
+    removed = [s for s in old if s not in active]
+
+    print(
+        "YALCIN PRO - SEMBOL EVRENI GUNCELLENDI:",
+        len(active),
+        "HISSE | YENI:",
+        len(added),
+        "CIKAN:",
+        len(removed)
+    )
+
+    return active
+
+
+def get_bist_symbols():
+    # Önce doğrulanmış aktif cache.
     with _symbol_list_lock:
         current = list(_symbol_list)
 
-    if current:
-        return current
+    if not current:
+        current = _load_active_symbol_cache()
 
-    return []
+    # İlk açılışta doğrulama gerekir. Sonraki çağrılarda 5 dakikada bir
+    # KAP + Yahoo keşfi yapılarak yeni hisseler otomatik eklenir.
+    return _refresh_symbol_universe(force=not bool(current))
 
 
 # =============================================================
@@ -1481,6 +1706,16 @@ def start_background_refresh(
             try:
 
                 # -------------------------------------------------
+                # GÜNCEL BIST EVRENİNİ KONTROL ET
+                # Yeni eklenen hisseler otomatik dahil edilir.
+                # -------------------------------------------------
+
+                latest_symbols = _refresh_symbol_universe()
+
+                if latest_symbols:
+                    refresh_symbols = list(latest_symbols)
+
+                # -------------------------------------------------
                 # GRUPLARI OLUŞTUR
                 # -------------------------------------------------
 
@@ -2147,6 +2382,12 @@ if __name__ == "__main__":
     print(
         "CANLI YENILEME:",
         BACKGROUND_REFRESH_SECONDS,
+        "SANIYE"
+    )
+
+    print(
+        "SEMBOL YENILEME:",
+        SYMBOL_REFRESH_SECONDS,
         "SANIYE"
     )
 
