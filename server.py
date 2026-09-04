@@ -4,6 +4,9 @@ import threading
 import time
 import os
 import json
+import re
+import urllib.request
+from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
 
@@ -20,29 +23,37 @@ ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 # AYARLAR
 # =============================================================
 
-# Bir Yahoo isteğinde işlenecek hisse sayısı
+# Yahoo bir istekte kaç hisse işleyecek
 BATCH_SIZE = 50
 
-# Cache'in taze kabul edileceği süre
+# Cache kaç saniye taze kabul edilecek
 CACHE_TTL_SECONDS = 20
 
-# Bir yenileme turundan sonra tekrar başlama süresi
+# Bir yenileme turundan sonra bekleme
 BACKGROUND_REFRESH_SECONDS = 10
 
 # Başarısız gruplar için tekrar deneme
 RETRY_COUNT = 2
+
+# Retry arası bekleme
 RETRY_WAIT_SECONDS = 2
 
 # Yahoo intraday
 INTRADAY_PERIOD = "1d"
 INTRADAY_INTERVAL = "5m"
 
-# Önceki kapanışı bulmak için günlük veri
+# Önceki kapanış için günlük veri
 DAILY_PERIOD = "5d"
 DAILY_INTERVAL = "1d"
 
-# Kalıcı cache
+# Kalıcı fiyat cache
 PERSISTENT_CACHE_FILE = "yalcin_pro_cache.json"
+
+# Dinamik sembol cache
+SYMBOL_CACHE_FILE = "yalcin_pro_symbols.json"
+
+# KAP BIST şirketleri
+KAP_BIST_URL = "https://kap.org.tr/tr/bist-sirketler"
 
 
 # =============================================================
@@ -56,6 +67,15 @@ _cache_lock = threading.Lock()
 _background_refresh_started = False
 
 _refresh_lock = threading.Lock()
+
+
+# =============================================================
+# DİNAMİK SEMBOL CACHE
+# =============================================================
+
+_symbol_list = []
+
+_symbol_list_lock = threading.Lock()
 
 
 # =============================================================
@@ -77,7 +97,425 @@ def normalize_symbol(symbol):
 
 
 # =============================================================
-# CACHE DOSYASINI YÜKLE
+# KAP SEMBOL NORMALİZASYONU
+# =============================================================
+
+def normalize_kap_symbol(symbol):
+
+    if not symbol:
+        return ""
+
+    symbol = str(symbol).strip().upper()
+
+    # Bazı KAP linklerinde:
+    #
+    # A1CAP ACP
+    # ALBRK ALK
+    #
+    # gibi ikinci ifade bulunabiliyor.
+    #
+    # İlk parçayı sembol adayı olarak alıyoruz.
+
+    parts = symbol.split()
+
+    if not parts:
+        return ""
+
+    symbol = parts[0]
+
+    symbol = (
+        symbol
+        .replace(".IS", "")
+        .replace(",", "")
+        .replace(";", "")
+        .strip()
+    )
+
+    # BIST sembolleri için güvenli karakter kümesi
+    if not re.fullmatch(
+        r"[A-Z0-9]{2,8}",
+        symbol
+    ):
+        return ""
+
+    return symbol
+
+
+# =============================================================
+# KAP HTML PARSER
+# =============================================================
+
+class KAPSymbolParser(HTMLParser):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.in_link = False
+
+        self.current_text = []
+
+        self.symbols = []
+
+    def handle_starttag(
+        self,
+        tag,
+        attrs
+    ):
+
+        if tag.lower() != "a":
+            return
+
+        href = ""
+
+        for key, value in attrs:
+
+            if key.lower() == "href":
+
+                href = value or ""
+
+                break
+
+        if "/tr/sirket-bilgileri/" in href.lower():
+
+            self.in_link = True
+
+            self.current_text = []
+
+    def handle_data(self, data):
+
+        if self.in_link:
+
+            self.current_text.append(data)
+
+    def handle_endtag(self, tag):
+
+        if tag.lower() != "a":
+            return
+
+        if not self.in_link:
+            return
+
+        text = " ".join(
+            self.current_text
+        ).strip()
+
+        self.in_link = False
+
+        self.current_text = []
+
+        if not text:
+            return
+
+        # Örnek:
+        #
+        # ACSEL
+        # A1CAP ACP
+        # ALBRK ALK
+        #
+        # İlk kelimeyi al.
+
+        candidate = text.split()[0]
+
+        symbol = normalize_kap_symbol(
+            candidate
+        )
+
+        if symbol:
+
+            self.symbols.append(
+                symbol
+            )
+
+
+# =============================================================
+# KAP SEMBOLLERİNİ İNDİR
+# =============================================================
+
+def _download_kap_symbols():
+
+    print(
+        "YALCIN PRO - KAP BIST SEMBOLLERI ALINIYOR..."
+    )
+
+    try:
+
+        req = urllib.request.Request(
+
+            KAP_BIST_URL,
+
+            headers={
+                "User-Agent":
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/120.0 Safari/537.36",
+                "Accept":
+                    "text/html,application/xhtml+xml"
+            }
+        )
+
+        with urllib.request.urlopen(
+            req,
+            timeout=20
+        ) as response:
+
+            html = response.read().decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+        parser = KAPSymbolParser()
+
+        parser.feed(html)
+
+        symbols = list(
+            dict.fromkeys(
+                parser.symbols
+            )
+        )
+
+        print(
+            "YALCIN PRO - KAP HAM SEMBOL:",
+            len(symbols),
+            "HISSE"
+        )
+
+        # KAP sayfası başarısız veya HTML
+        # yapısı değişmişse mevcut listeyi bozma.
+
+        if len(symbols) < 100:
+
+            print(
+                "YALCIN PRO - KAP SEMBOL LISTESI YETERSIZ:",
+                len(symbols)
+            )
+
+            return []
+
+        print(
+            "YALCIN PRO - KAP SEMBOL LISTESI HAZIR:",
+            len(symbols),
+            "HISSE"
+        )
+
+        return symbols
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - KAP SEMBOL HATASI:",
+            e
+        )
+
+        return []
+
+
+# =============================================================
+# SEMBOL CACHE YÜKLE
+# =============================================================
+
+def _load_symbol_cache():
+
+    global _symbol_list
+
+    try:
+
+        if not os.path.exists(
+            SYMBOL_CACHE_FILE
+        ):
+
+            print(
+                "YALCIN PRO - SEMBOL CACHE DOSYASI YOK"
+            )
+
+            return
+
+        with open(
+            SYMBOL_CACHE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            saved = json.load(f)
+
+        if not isinstance(
+            saved,
+            list
+        ):
+
+            return
+
+        cleaned = []
+
+        for symbol in saved:
+
+            normalized = normalize_symbol(
+                symbol
+            )
+
+            if normalized:
+
+                cleaned.append(
+                    normalized
+                )
+
+        cleaned = list(
+            dict.fromkeys(
+                cleaned
+            )
+        )
+
+        with _symbol_list_lock:
+
+            _symbol_list = cleaned
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE YUKLENDI:",
+            len(cleaned),
+            "HISSE"
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE OKUMA HATASI:",
+            e
+        )
+
+
+# =============================================================
+# SEMBOL CACHE KAYDET
+# =============================================================
+
+def _save_symbol_cache(
+    symbols
+):
+
+    try:
+
+        cleaned = []
+
+        for symbol in symbols:
+
+            normalized = normalize_symbol(
+                symbol
+            )
+
+            if normalized:
+
+                cleaned.append(
+                    normalized
+                )
+
+        cleaned = list(
+            dict.fromkeys(
+                cleaned
+            )
+        )
+
+        temp_file = (
+            SYMBOL_CACHE_FILE
+            + ".tmp"
+        )
+
+        with open(
+            temp_file,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                cleaned,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        os.replace(
+            temp_file,
+            SYMBOL_CACHE_FILE
+        )
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE KAYDEDILDI:",
+            len(cleaned)
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE YAZMA HATASI:",
+            e
+        )
+
+
+# =============================================================
+# BIST SEMBOLLERİNİ GETİR
+# =============================================================
+
+def get_bist_symbols():
+
+    global _symbol_list
+
+    # ---------------------------------------------------------
+    # 1 - RAM CACHE
+    # ---------------------------------------------------------
+
+    with _symbol_list_lock:
+
+        current = list(
+            _symbol_list
+        )
+
+    if current:
+
+        return current
+
+    # ---------------------------------------------------------
+    # 2 - DOSYA CACHE
+    # ---------------------------------------------------------
+
+    _load_symbol_cache()
+
+    with _symbol_list_lock:
+
+        current = list(
+            _symbol_list
+        )
+
+    if current:
+
+        return current
+
+    # ---------------------------------------------------------
+    # 3 - KAP
+    # ---------------------------------------------------------
+
+    fresh_symbols = (
+        _download_kap_symbols()
+    )
+
+    if fresh_symbols:
+
+        with _symbol_list_lock:
+
+            _symbol_list = (
+                fresh_symbols
+            )
+
+        _save_symbol_cache(
+            fresh_symbols
+        )
+
+        return fresh_symbols
+
+    return []
+
+
+# =============================================================
+# FİYAT CACHE DOSYASINI YÜKLE
 # =============================================================
 
 def _load_persistent_cache():
@@ -86,7 +524,9 @@ def _load_persistent_cache():
 
     try:
 
-        if not os.path.exists(PERSISTENT_CACHE_FILE):
+        if not os.path.exists(
+            PERSISTENT_CACHE_FILE
+        ):
 
             print(
                 "YALCIN PRO - KALICI CACHE DOSYASI YOK"
@@ -111,21 +551,38 @@ def _load_persistent_cache():
                 try:
 
                     if (
-                        isinstance(item, list)
-                        and len(item) == 2
-                        and isinstance(item[1], dict)
+                        isinstance(
+                            item,
+                            list
+                        )
+                        and
+                        len(item) == 2
+                        and
+                        isinstance(
+                            item[1],
+                            dict
+                        )
                     ):
 
-                        normalized = normalize_symbol(symbol)
+                        normalized = (
+                            normalize_symbol(
+                                symbol
+                            )
+                        )
 
                         if not normalized:
+
                             continue
 
-                        timestamp = float(item[0])
+                        timestamp = float(
+                            item[0]
+                        )
 
                         result = item[1]
 
-                        _stock_cache[normalized] = (
+                        _stock_cache[
+                            normalized
+                        ] = (
                             timestamp,
                             result
                         )
@@ -133,6 +590,7 @@ def _load_persistent_cache():
                         loaded += 1
 
                 except Exception:
+
                     continue
 
         print(
@@ -150,7 +608,7 @@ def _load_persistent_cache():
 
 
 # =============================================================
-# CACHE DOSYASINI KAYDET
+# FİYAT CACHE DOSYASINI KAYDET
 # =============================================================
 
 def _save_persistent_cache():
@@ -160,14 +618,18 @@ def _save_persistent_cache():
         with _cache_lock:
 
             data = {
+
                 symbol: [
                     timestamp,
                     result
                 ]
+
                 for symbol, (
                     timestamp,
                     result
-                ) in _stock_cache.items()
+                )
+                in _stock_cache.items()
+
             }
 
         temp_file = (
@@ -204,27 +666,41 @@ def _save_persistent_cache():
 # CACHE OKU
 # =============================================================
 
-def _get_cache(symbol):
+def _get_cache(
+    symbol
+):
 
-    symbol = normalize_symbol(symbol)
+    symbol = normalize_symbol(
+        symbol
+    )
 
     if not symbol:
+
         return None, False
 
     now = time.time()
 
     with _cache_lock:
 
-        item = _stock_cache.get(symbol)
+        item = _stock_cache.get(
+            symbol
+        )
 
         if not item:
+
             return None, False
 
         timestamp, result = item
 
-    age = now - timestamp
+    age = (
+        now
+        - timestamp
+    )
 
-    fresh = age < CACHE_TTL_SECONDS
+    fresh = (
+        age
+        < CACHE_TTL_SECONDS
+    )
 
     return result, fresh
 
@@ -238,14 +714,19 @@ def _save_stock_memory(
     result
 ):
 
-    symbol = normalize_symbol(symbol)
+    symbol = normalize_symbol(
+        symbol
+    )
 
     if not symbol or not result:
+
         return
 
     with _cache_lock:
 
-        _stock_cache[symbol] = (
+        _stock_cache[
+            symbol
+        ] = (
             time.time(),
             result
         )
@@ -261,11 +742,13 @@ def _extract_close(
 ):
 
     if data is None:
+
         return None
 
     try:
 
         if data.empty:
+
             return None
 
     except Exception:
@@ -274,9 +757,9 @@ def _extract_close(
 
     try:
 
-        # =====================================================
+        # -----------------------------------------------------
         # MULTI INDEX
-        # =====================================================
+        # -----------------------------------------------------
 
         if hasattr(
             data.columns,
@@ -293,9 +776,9 @@ def _extract_close(
                 .get_level_values(1)
             )
 
-            # ---------------------------------------------
+            # -------------------------------------------------
             # Ticker -> Close
-            # ---------------------------------------------
+            # -------------------------------------------------
 
             if ticker_name in level0:
 
@@ -314,30 +797,36 @@ def _extract_close(
                 ):
 
                     return (
-                        ticker_data["Close"]
+                        ticker_data[
+                            "Close"
+                        ]
                         .dropna()
                     )
 
-            # ---------------------------------------------
+            # -------------------------------------------------
             # Close -> Ticker
-            # ---------------------------------------------
+            # -------------------------------------------------
 
             if (
-                "Close" in level0
+                "Close"
+                in level0
                 and
-                ticker_name in level1
+                ticker_name
+                in level1
             ):
 
                 return (
-                    data["Close"][
+                    data[
+                        "Close"
+                    ][
                         ticker_name
                     ]
                     .dropna()
                 )
 
-        # =====================================================
+        # -----------------------------------------------------
         # NORMAL DATA
-        # =====================================================
+        # -----------------------------------------------------
 
         if "Close" in data.columns:
 
@@ -367,12 +856,16 @@ def _make_result(
     previous_close=None
 ):
 
-    symbol = normalize_symbol(symbol)
+    symbol = normalize_symbol(
+        symbol
+    )
 
     if not symbol:
+
         return None
 
     if closes is None:
+
         return None
 
     try:
@@ -384,11 +877,12 @@ def _make_result(
         return None
 
     if closes.empty:
+
         return None
 
-    # =========================================================
+    # ---------------------------------------------------------
     # SON FİYAT
-    # =========================================================
+    # ---------------------------------------------------------
 
     try:
 
@@ -401,16 +895,17 @@ def _make_result(
         return None
 
     if price <= 0:
+
         return None
 
-    # =========================================================
+    # ---------------------------------------------------------
     # ÖNCEKİ KAPANIŞ
-    # =========================================================
+    # ---------------------------------------------------------
 
     previous = None
 
     # ---------------------------------------------------------
-    # 1 - Günlük veriden önceki kapanış
+    # 1 - Günlük veri
     # ---------------------------------------------------------
 
     if previous_close is not None:
@@ -422,6 +917,7 @@ def _make_result(
             )
 
             if value > 0:
+
                 previous = value
 
         except Exception:
@@ -467,6 +963,7 @@ def _make_result(
                         )
 
                         if value > 0:
+
                             previous = value
 
         except Exception:
@@ -481,9 +978,9 @@ def _make_result(
 
         previous = price
 
-    # =========================================================
+    # ---------------------------------------------------------
     # DEĞİŞİM %
-    # =========================================================
+    # ---------------------------------------------------------
 
     try:
 
@@ -503,41 +1000,45 @@ def _make_result(
 
         change = 0.0
 
-    # =========================================================
-    # ÇOK KÜÇÜK HATALARI TEMİZLE
-    # =========================================================
+    # ---------------------------------------------------------
+    # Çok küçük değerleri temizle
+    # ---------------------------------------------------------
 
     if abs(change) < 0.000001:
 
         change = 0.0
 
-    # =========================================================
+    # ---------------------------------------------------------
     # SONUÇ
-    # =========================================================
+    # ---------------------------------------------------------
 
-    result = {
+    return {
 
-        "sembol": symbol,
+        "sembol":
+            symbol,
 
-        "fiyat": round(
-            price,
-            2
-        ),
+        "fiyat":
+            round(
+                price,
+                2
+            ),
 
-        "oncekiKapanis": round(
-            previous,
-            2
-        ),
+        "oncekiKapanis":
+            round(
+                previous,
+                2
+            ),
 
-        "degisimYuzde": round(
-            change,
-            2
-        ),
+        "degisimYuzde":
+            round(
+                change,
+                2
+            ),
 
-        "paraBirimi": "TRY"
+        "paraBirimi":
+            "TRY"
+
     }
-
-    return result
 
 
 # =============================================================
@@ -549,13 +1050,19 @@ def get_stocks_batch(
 ):
 
     symbols = [
+
         normalize_symbol(s)
+
         for s in symbols
+
         if normalize_symbol(s)
+
     ]
 
     symbols = list(
-        dict.fromkeys(symbols)
+        dict.fromkeys(
+            symbols
+        )
     )
 
     if not symbols:
@@ -567,8 +1074,11 @@ def get_stocks_batch(
     missing = []
 
     tickers = [
+
         symbol + ".IS"
+
         for symbol in symbols
+
     ]
 
     try:
@@ -579,9 +1089,9 @@ def get_stocks_batch(
             "HISSE"
         )
 
-        # =====================================================
+        # -----------------------------------------------------
         # INTRADAY
-        # =====================================================
+        # -----------------------------------------------------
 
         intraday_data = yf.download(
 
@@ -600,11 +1110,12 @@ def get_stocks_batch(
             threads=True,
 
             progress=False
+
         )
 
-        # =====================================================
+        # -----------------------------------------------------
         # GÜNLÜK
-        # =====================================================
+        # -----------------------------------------------------
 
         daily_data = yf.download(
 
@@ -623,11 +1134,12 @@ def get_stocks_batch(
             threads=True,
 
             progress=False
+
         )
 
-        # =====================================================
+        # -----------------------------------------------------
         # HİSSELER
-        # =====================================================
+        # -----------------------------------------------------
 
         for symbol in symbols:
 
@@ -646,6 +1158,7 @@ def get_stocks_batch(
                     intraday_data,
 
                     ticker_name
+
                 )
 
                 # -------------------------------------------------
@@ -654,7 +1167,8 @@ def get_stocks_batch(
 
                 if (
                     closes is None
-                    or closes.empty
+                    or
+                    closes.empty
                 ):
 
                     closes = _extract_close(
@@ -662,11 +1176,13 @@ def get_stocks_batch(
                         daily_data,
 
                         ticker_name
+
                     )
 
                 if (
                     closes is None
-                    or closes.empty
+                    or
+                    closes.empty
                 ):
 
                     missing.append(
@@ -699,7 +1215,9 @@ def get_stocks_batch(
                         .dropna()
                     )
 
-                    if len(daily_closes) >= 2:
+                    if len(
+                        daily_closes
+                    ) >= 2:
 
                         try:
 
@@ -709,7 +1227,9 @@ def get_stocks_batch(
 
                             if value > 0:
 
-                                previous_close = value
+                                previous_close = (
+                                    value
+                                )
 
                         except Exception:
 
@@ -726,6 +1246,7 @@ def get_stocks_batch(
                     closes,
 
                     previous_close
+
                 )
 
                 if result:
@@ -759,7 +1280,9 @@ def get_stocks_batch(
             e
         )
 
-        return [], list(symbols)
+        return [], list(
+            symbols
+        )
 
     print(
         "YALCIN PRO - GRUP SONUCU:",
@@ -771,6 +1294,178 @@ def get_stocks_batch(
     )
 
     return results, missing
+
+
+# =============================================================
+# TEK HİSSE - YAHOO
+# =============================================================
+
+def get_stock_from_yahoo(
+    symbol
+):
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+    if not symbol:
+
+        return None
+
+    ticker_name = (
+        symbol + ".IS"
+    )
+
+    try:
+
+        print(
+            "YALCIN PRO - TEK YAHOO:",
+            ticker_name
+        )
+
+        # -----------------------------------------------------
+        # INTRADAY
+        # -----------------------------------------------------
+
+        intraday = yf.download(
+
+            tickers=ticker_name,
+
+            period=INTRADAY_PERIOD,
+
+            interval=INTRADAY_INTERVAL,
+
+            auto_adjust=False,
+
+            prepost=False,
+
+            threads=False,
+
+            progress=False
+
+        )
+
+        closes = _extract_close(
+
+            intraday,
+
+            ticker_name
+
+        )
+
+        # -----------------------------------------------------
+        # GÜNLÜK
+        # -----------------------------------------------------
+
+        daily = yf.download(
+
+            tickers=ticker_name,
+
+            period=DAILY_PERIOD,
+
+            interval=DAILY_INTERVAL,
+
+            auto_adjust=False,
+
+            prepost=False,
+
+            threads=False,
+
+            progress=False
+
+        )
+
+        daily_closes = _extract_close(
+
+            daily,
+
+            ticker_name
+
+        )
+
+        # -----------------------------------------------------
+        # INTRADAY YOKSA GÜNLÜK
+        # -----------------------------------------------------
+
+        if (
+            closes is None
+            or
+            closes.empty
+        ):
+
+            closes = daily_closes
+
+        if (
+            closes is None
+            or
+            closes.empty
+        ):
+
+            print(
+                "YALCIN PRO - VERI YOK:",
+                symbol
+            )
+
+            return None
+
+        # -----------------------------------------------------
+        # ÖNCEKİ KAPANIŞ
+        # -----------------------------------------------------
+
+        previous_close = None
+
+        if (
+            daily_closes is not None
+            and
+            not daily_closes.empty
+        ):
+
+            daily_closes = (
+                daily_closes
+                .dropna()
+            )
+
+            if len(
+                daily_closes
+            ) >= 2:
+
+                try:
+
+                    previous_close = float(
+                        daily_closes.iloc[-2]
+                    )
+
+                    if previous_close <= 0:
+
+                        previous_close = None
+
+                except Exception:
+
+                    previous_close = None
+
+        # -----------------------------------------------------
+        # SONUÇ
+        # -----------------------------------------------------
+
+        return _make_result(
+
+            symbol,
+
+            closes,
+
+            previous_close
+
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - YAHOO HATASI:",
+            symbol,
+            e
+        )
+
+        return None
 
 
 # =============================================================
@@ -791,10 +1486,12 @@ def start_background_refresh(
             for s in symbols
 
             if normalize_symbol(s)
+
         )
     )
 
     if not refresh_symbols:
+
         return
 
     with _refresh_lock:
@@ -819,19 +1516,22 @@ def start_background_refresh(
 
             try:
 
-                # =================================================
+                # -------------------------------------------------
                 # GRUPLARI OLUŞTUR
-                # =================================================
+                # -------------------------------------------------
 
                 batches = [
 
-                    refresh_symbols[i:i + BATCH_SIZE]
+                    refresh_symbols[
+                        i:i + BATCH_SIZE
+                    ]
 
                     for i in range(
                         0,
                         len(refresh_symbols),
                         BATCH_SIZE
                     )
+
                 ]
 
                 total_updated = 0
@@ -844,9 +1544,9 @@ def start_background_refresh(
                     "GRUP"
                 )
 
-                # =================================================
+                # -------------------------------------------------
                 # HER GRUP
-                # =================================================
+                # -------------------------------------------------
 
                 for index, batch in enumerate(
                     batches,
@@ -865,11 +1565,9 @@ def start_background_refresh(
 
                     success = False
 
-                    last_missing = list(batch)
-
-                    # =================================================
+                    # -------------------------------------------------
                     # RETRY
-                    # =================================================
+                    # -------------------------------------------------
 
                     for retry in range(
                         RETRY_COUNT + 1
@@ -884,33 +1582,36 @@ def start_background_refresh(
                             )
 
                             # -----------------------------------------
-                            # BAŞARILI VERİLER CACHE
+                            # BAŞARILI VERİLERİ CACHE
                             # -----------------------------------------
 
                             for result in results:
 
                                 symbol = normalize_symbol(
+
                                     result.get(
                                         "sembol",
                                         ""
                                     )
+
                                 )
 
                                 if symbol:
 
                                     _save_stock_memory(
+
                                         symbol,
+
                                         result
+
                                     )
 
-                            total_updated += len(
-                                results
+                            total_updated += (
+                                len(results)
                             )
 
-                            last_missing = missing
-
-                            total_missing += len(
-                                missing
+                            total_missing += (
+                                len(missing)
                             )
 
                             success = True
@@ -944,9 +1645,9 @@ def start_background_refresh(
                                     RETRY_WAIT_SECONDS
                                 )
 
-                    # =================================================
+                    # -------------------------------------------------
                     # BAŞARISIZSA ESKİ CACHE KORUNUR
-                    # =================================================
+                    # -------------------------------------------------
 
                     if not success:
 
@@ -957,18 +1658,18 @@ def start_background_refresh(
                             len(batch)
                         )
 
-                    # Gruplar arasında kısa bekleme
+                    # Gruplar arası kısa bekleme
                     time.sleep(0.5)
 
-                # =================================================
+                # -------------------------------------------------
                 # CACHE DOSYASINI TEK SEFERDE KAYDET
-                # =================================================
+                # -------------------------------------------------
 
                 _save_persistent_cache()
 
-                # =================================================
+                # -------------------------------------------------
                 # CACHE DURUMU
-                # =================================================
+                # -------------------------------------------------
 
                 with _cache_lock:
 
@@ -987,9 +1688,9 @@ def start_background_refresh(
                     total_missing
                 )
 
-                # =================================================
+                # -------------------------------------------------
                 # SONRAKİ TUR
-                # =================================================
+                # -------------------------------------------------
 
                 time.sleep(
                     BACKGROUND_REFRESH_SECONDS
@@ -1011,6 +1712,7 @@ def start_background_refresh(
         daemon=True,
 
         name="yalcin-cache-refresh"
+
     )
 
     thread.start()
@@ -1021,6 +1723,8 @@ def start_background_refresh(
 # =============================================================
 
 _load_persistent_cache()
+
+_load_symbol_cache()
 
 
 # =============================================================
@@ -1036,15 +1740,28 @@ def health():
             _stock_cache
         )
 
+    with _symbol_list_lock:
+
+        symbol_count = len(
+            _symbol_list
+        )
+
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
-        "status": "online",
+        "status":
+            "online",
 
-        "cache": cache_count,
+        "cache":
+            cache_count,
 
-        "serverTime": datetime_now()
+        "symbols":
+            symbol_count,
+
+        "serverTime":
+            datetime_now()
 
     })
 
@@ -1059,6 +1776,49 @@ def datetime_now():
         "%Y-%m-%d %H:%M:%S",
         time.localtime()
     )
+
+
+# =============================================================
+# DİNAMİK BIST SEMBOLLERİ
+# =============================================================
+
+@app.route("/symbols")
+def symbols():
+
+    symbol_list = (
+        get_bist_symbols()
+    )
+
+    if not symbol_list:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "count":
+                0,
+
+            "symbols":
+                [],
+
+            "error":
+                "BIST sembol listesi alınamadı"
+
+        }), 503
+
+    return jsonify({
+
+        "success":
+            True,
+
+        "count":
+            len(symbol_list),
+
+        "symbols":
+            symbol_list
+
+    })
 
 
 # =============================================================
@@ -1080,9 +1840,11 @@ def single_stock(
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
-            "data": []
+            "data":
+                []
 
         }), 400
 
@@ -1090,15 +1852,20 @@ def single_stock(
         symbol
     )
 
-    # =========================================================
+    # ---------------------------------------------------------
     # CACHE TAZE
-    # =========================================================
+    # ---------------------------------------------------------
 
-    if result is not None and fresh:
+    if (
+        result is not None
+        and
+        fresh
+    ):
 
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
             "data": [
                 result
@@ -1106,9 +1873,9 @@ def single_stock(
 
         })
 
-    # =========================================================
+    # ---------------------------------------------------------
     # CACHE ESKİYSE ARKA PLANDA GÜNCELLE
-    # =========================================================
+    # ---------------------------------------------------------
 
     def update_one():
 
@@ -1123,8 +1890,11 @@ def single_stock(
             if new_result:
 
                 _save_stock_memory(
+
                     symbol,
+
                     new_result
+
                 )
 
                 _save_persistent_cache()
@@ -1142,19 +1912,21 @@ def single_stock(
         target=update_one,
 
         daemon=True
+
     )
 
     thread.start()
 
-    # =========================================================
+    # ---------------------------------------------------------
     # ESKİ VERİ VARSA HEMEN GÖNDER
-    # =========================================================
+    # ---------------------------------------------------------
 
     if result is not None:
 
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
             "data": [
                 result
@@ -1162,175 +1934,19 @@ def single_stock(
 
         })
 
-    # =========================================================
+    # ---------------------------------------------------------
     # VERİ YOKSA
-    # =========================================================
+    # ---------------------------------------------------------
 
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
-        "data": []
+        "data":
+            []
 
     })
-
-
-# =============================================================
-# TEK HİSSE - YAHOO
-# =============================================================
-
-def get_stock_from_yahoo(
-    symbol
-):
-
-    symbol = normalize_symbol(
-        symbol
-    )
-
-    if not symbol:
-        return None
-
-    ticker_name = (
-        symbol + ".IS"
-    )
-
-    try:
-
-        print(
-            "YALCIN PRO - TEK YAHOO:",
-            ticker_name
-        )
-
-        # =====================================================
-        # INTRADAY
-        # =====================================================
-
-        intraday = yf.download(
-
-            tickers=ticker_name,
-
-            period=INTRADAY_PERIOD,
-
-            interval=INTRADAY_INTERVAL,
-
-            auto_adjust=False,
-
-            prepost=False,
-
-            threads=False,
-
-            progress=False
-        )
-
-        closes = _extract_close(
-            intraday,
-            ticker_name
-        )
-
-        # =====================================================
-        # GÜNLÜK
-        # =====================================================
-
-        daily = yf.download(
-
-            tickers=ticker_name,
-
-            period=DAILY_PERIOD,
-
-            interval=DAILY_INTERVAL,
-
-            auto_adjust=False,
-
-            prepost=False,
-
-            threads=False,
-
-            progress=False
-        )
-
-        daily_closes = _extract_close(
-            daily,
-            ticker_name
-        )
-
-        # =====================================================
-        # INTRADAY YOKSA GÜNLÜK
-        # =====================================================
-
-        if (
-            closes is None
-            or closes.empty
-        ):
-
-            closes = daily_closes
-
-        if (
-            closes is None
-            or closes.empty
-        ):
-
-            print(
-                "YALCIN PRO - VERI YOK:",
-                symbol
-            )
-
-            return None
-
-        # =====================================================
-        # ÖNCEKİ KAPANIŞ
-        # =====================================================
-
-        previous_close = None
-
-        if (
-            daily_closes is not None
-            and
-            not daily_closes.empty
-        ):
-
-            daily_closes = (
-                daily_closes
-                .dropna()
-            )
-
-            if len(daily_closes) >= 2:
-
-                try:
-
-                    previous_close = float(
-                        daily_closes.iloc[-2]
-                    )
-
-                    if previous_close <= 0:
-
-                        previous_close = None
-
-                except Exception:
-
-                    previous_close = None
-
-        # =====================================================
-        # SONUÇ
-        # =====================================================
-
-        return _make_result(
-
-            symbol,
-
-            closes,
-
-            previous_close
-        )
-
-    except Exception as e:
-
-        print(
-            "YALCIN PRO - YAHOO HATASI:",
-            symbol,
-            e
-        )
-
-        return None
 
 
 # =============================================================
@@ -1345,37 +1961,49 @@ def stocks():
         ""
     )
 
+    # ---------------------------------------------------------
+    # ANDROID SEMBOL GÖNDERMEDİYSE
+    # DİNAMİK LİSTEYİ KULLAN
+    # ---------------------------------------------------------
+
     if not symbols_text:
+
+        symbols = (
+            get_bist_symbols()
+        )
+
+    else:
+
+        symbols = [
+
+            normalize_symbol(s)
+
+            for s in symbols_text.split(",")
+
+            if s.strip()
+
+        ]
+
+        symbols = list(
+            dict.fromkeys(
+                symbols
+            )
+        )
+
+    if not symbols:
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
-            "error": (
-                "symbols parametresi gerekli"
-            ),
+            "error":
+                "Hisse sembol listesi bulunamadı",
 
-            "data": []
+            "data":
+                []
 
-        }), 400
-
-    # =========================================================
-    # SEMBOLLERİ TEMİZLE
-    # =========================================================
-
-    symbols = [
-
-        normalize_symbol(s)
-
-        for s in symbols_text.split(",")
-
-        if s.strip()
-
-    ]
-
-    symbols = list(
-        dict.fromkeys(symbols)
-    )
+        }), 503
 
     print(
         "================================================="
@@ -1387,17 +2015,17 @@ def stocks():
         "HISSE"
     )
 
-    # =========================================================
+    # ---------------------------------------------------------
     # ARKA PLAN YENİLEME
-    # =========================================================
+    # ---------------------------------------------------------
 
     start_background_refresh(
         symbols
     )
 
-    # =========================================================
-    # CACHE'DEN HEMEN CEVAP
-    # =========================================================
+    # ---------------------------------------------------------
+    # CACHE
+    # ---------------------------------------------------------
 
     result_map = {}
 
@@ -1414,6 +2042,7 @@ def stocks():
             )
 
             if not item:
+
                 continue
 
             timestamp, result = item
@@ -1423,9 +2052,15 @@ def stocks():
                 - timestamp
             )
 
-            result_map[symbol] = result
+            result_map[
+                symbol
+            ] = result
 
-            if age < CACHE_TTL_SECONDS:
+            if (
+                age
+                <
+                CACHE_TTL_SECONDS
+            ):
 
                 fresh_count += 1
 
@@ -1433,9 +2068,9 @@ def stocks():
 
                 stale_count += 1
 
-    # =========================================================
+    # ---------------------------------------------------------
     # ANDROID SIRASINI KORU
-    # =========================================================
+    # ---------------------------------------------------------
 
     ordered_results = [
 
@@ -1447,9 +2082,9 @@ def stocks():
 
     ]
 
-    # =========================================================
+    # ---------------------------------------------------------
     # EKSİKLER
-    # =========================================================
+    # ---------------------------------------------------------
 
     missing = [
 
@@ -1478,7 +2113,9 @@ def stocks():
 
         print(
             "YALCIN PRO - VERISI OLMAYAN:",
-            ", ".join(missing[:50])
+            ", ".join(
+                missing[:50]
+            )
         )
 
     print(
@@ -1492,15 +2129,13 @@ def stocks():
         "================================================="
     )
 
-    # =========================================================
-    # ANINDA JSON
-    # =========================================================
-
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
-        "data": ordered_results
+        "data":
+            ordered_results
 
     })
 
@@ -1517,6 +2152,12 @@ if __name__ == "__main__":
             _stock_cache
         )
 
+    with _symbol_list_lock:
+
+        symbol_count = len(
+            _symbol_list
+        )
+
     print(
         "================================================="
     )
@@ -1528,6 +2169,12 @@ if __name__ == "__main__":
     print(
         "CACHE:",
         cache_count,
+        "HISSE"
+    )
+
+    print(
+        "SEMBOL:",
+        symbol_count,
         "HISSE"
     )
 
@@ -1573,4 +2220,5 @@ if __name__ == "__main__":
         debug=False,
 
         threaded=True
+
     )
