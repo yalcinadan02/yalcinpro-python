@@ -146,86 +146,54 @@ def normalize_kap_symbol(symbol):
 # =============================================================
 
 class KAPSymbolParser(HTMLParser):
-
     def __init__(self):
-
         super().__init__()
-
         self.in_link = False
-
         self.current_text = []
-
         self.symbols = []
 
-    def handle_starttag(
-        self,
-        tag,
-        attrs
-    ):
-
+    def handle_starttag(self, tag, attrs):
         if tag.lower() != "a":
             return
-
         href = ""
-
         for key, value in attrs:
-
             if key.lower() == "href":
-
                 href = value or ""
-
                 break
-
         if "/tr/sirket-bilgileri/" in href.lower():
-
             self.in_link = True
-
             self.current_text = []
 
     def handle_data(self, data):
-
         if self.in_link:
-
             self.current_text.append(data)
 
     def handle_endtag(self, tag):
-
-        if tag.lower() != "a":
+        if tag.lower() != "a" or not self.in_link:
             return
 
-        if not self.in_link:
-            return
-
-        text = " ".join(
-            self.current_text
-        ).strip()
-
+        text = " ".join(self.current_text).strip()
         self.in_link = False
-
         self.current_text = []
 
         if not text:
             return
 
-        # Örnek:
-        #
-        # ACSEL
-        # A1CAP ACP
-        # ALBRK ALK
-        #
-        # İlk kelimeyi al.
+        # KAP'ta hisse kodu linki ile bağımsız denetim
+        # kuruluşu linki aynı URL yapısını kullanabiliyor.
+        # Bu nedenle sadece 1-2 adet saf kod içeren linkleri al.
+        tokens = re.findall(r"[A-Z0-9]{2,8}", text.upper())
 
-        candidate = text.split()[0]
+        if not tokens or len(tokens) > 2:
+            return
 
-        symbol = normalize_kap_symbol(
-            candidate
-        )
+        normalized_tokens = [
+            normalize_kap_symbol(token)
+            for token in tokens
+        ]
 
-        if symbol:
-
-            self.symbols.append(
-                symbol
-            )
+        if all(normalized_tokens):
+            self.symbols.extend(normalized_tokens)
 
 
 # =============================================================
@@ -361,14 +329,27 @@ def _load_symbol_cache():
                     normalized
                 )
 
-        cleaned = list(
-            dict.fromkeys(
-                cleaned
+        cleaned = list(dict.fromkeys(cleaned))
+
+        # Eski sürümde KAP'ın denetim kuruluşları da sembol olarak
+        # cache'e girmiş olabilir (ör. DRT, PWC). Böyle bir cache'i
+        # kullanma; yeni KAP listesini yeniden oluştur.
+        invalid_codes = {
+            "DRT", "PWC", "KPMG", "TTK", "BDO", "PKF",
+            "RSM", "BD", "CNS", "HSY", "KARAR", "REFORM"
+        }
+
+        if len(cleaned) > 800 or any(
+            code in invalid_codes for code in cleaned
+        ):
+            print(
+                "YALCIN PRO - ESKI/GEÇERSIZ SEMBOL CACHE ATILDI:",
+                len(cleaned),
+                "HISSE"
             )
-        )
+            return
 
         with _symbol_list_lock:
-
             _symbol_list = cleaned
 
         print(
@@ -456,60 +437,33 @@ def _save_symbol_cache(
 # =============================================================
 
 def get_bist_symbols():
-
     global _symbol_list
 
-    # ---------------------------------------------------------
-    # 1 - RAM CACHE
-    # ---------------------------------------------------------
-
+    # Önce RAM'de doğrulanmış liste varsa kullan.
     with _symbol_list_lock:
-
-        current = list(
-            _symbol_list
-        )
+        current = list(_symbol_list)
 
     if current:
-
         return current
 
-    # ---------------------------------------------------------
-    # 2 - DOSYA CACHE
-    # ---------------------------------------------------------
+    # Önce KAP'tan güncel BIST listesini al.
+    # Böylece eski/hatalı sembol cache'i yeni listeyi bozmaz.
+    fresh_symbols = _download_kap_symbols()
 
+    if fresh_symbols:
+        with _symbol_list_lock:
+            _symbol_list = fresh_symbols
+        _save_symbol_cache(fresh_symbols)
+        return fresh_symbols
+
+    # KAP erişilemezse doğrulanmış dosya cache'ini kullan.
     _load_symbol_cache()
 
     with _symbol_list_lock:
-
-        current = list(
-            _symbol_list
-        )
+        current = list(_symbol_list)
 
     if current:
-
         return current
-
-    # ---------------------------------------------------------
-    # 3 - KAP
-    # ---------------------------------------------------------
-
-    fresh_symbols = (
-        _download_kap_symbols()
-    )
-
-    if fresh_symbols:
-
-        with _symbol_list_lock:
-
-            _symbol_list = (
-                fresh_symbols
-            )
-
-        _save_symbol_cache(
-            fresh_symbols
-        )
-
-        return fresh_symbols
 
     return []
 
@@ -1723,8 +1677,6 @@ def start_background_refresh(
 # =============================================================
 
 _load_persistent_cache()
-
-_load_symbol_cache()
 
 
 # =============================================================
