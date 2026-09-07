@@ -76,9 +76,7 @@ KAP_BIST_URL = "https://kap.org.tr/tr/bist-sirketler"
 # Liste bu sınırı aşarsa HTML parser tekrar kontrol edilmeden kullanılmaz.
 MAX_KAP_SYMBOLS = 1200
 
-# YALCIN PRO'NUN GÖSTERECEĞİ HEDEF BIST HISSE SAYISI
-# Android tarafı sembol listesi gönderse bile server kendi 614 hisselik
-# evrenini esas alır.
+# YALCIN PRO hedef BIST hisse sayisi
 TARGET_BIST_STOCK_COUNT = 614
 
 # KAP listesinin içine zaman zaman karışabilen denetim kuruluşu
@@ -579,19 +577,15 @@ def _load_active_symbol_cache():
         if not cleaned:
             return []
 
-        # Eski/eksik cache (ör. 19 hisse) aktif evren olarak kullanılmaz.
-        # Böylece server KAP + Yahoo üzerinden 614 hisselik evreni yeniden kurar.
+        # Eski/eksik cache (or. 19 hisse) aktif evren olarak kullanilmaz.
         if len(cleaned) < TARGET_BIST_STOCK_COUNT:
             print(
                 "YALCIN PRO - AKTIF CACHE EKSIK:",
-                len(cleaned),
-                "/",
-                TARGET_BIST_STOCK_COUNT,
-                "HISSE - YENIDEN KESFEDILECEK"
+                len(cleaned), "/", TARGET_BIST_STOCK_COUNT,
+                "- YENIDEN KESFEDILECEK"
             )
             return []
 
-        # Hedef evreni tam olarak 614 ile sınırla.
         cleaned = cleaned[:TARGET_BIST_STOCK_COUNT]
 
         with _symbol_list_lock:
@@ -744,16 +738,14 @@ def _discover_active_symbols_from_kap(kap_symbols):
         if symbol in active
     ]
 
-    # YALCIN PRO hedefi: tam 614 hisse.
-    # KAP sırası korunur; alfabetik/sıralama Android tarafında yapılabilir.
     if len(ordered) > TARGET_BIST_STOCK_COUNT:
         ordered = ordered[:TARGET_BIST_STOCK_COUNT]
 
     print(
         "YALCIN PRO - AKTIF BIST EVRENI:",
         len(ordered),
-        "HISSE | HEDEF:",
-        TARGET_BIST_STOCK_COUNT
+        "/", TARGET_BIST_STOCK_COUNT,
+        "HISSE"
     )
 
     return ordered
@@ -820,10 +812,7 @@ def get_bist_symbols():
         current = _load_active_symbol_cache()
 
     # 614'ten azsa eski/eksik cache kesinlikle kullanılmaz.
-    # KAP + Yahoo keşfi yeniden çalışır.
     needs_discovery = len(current) < TARGET_BIST_STOCK_COUNT
-
-    # 614 ve üzeri ise normal 5 dakikalık yenileme mantığı devam eder.
     return _refresh_symbol_universe(force=needs_discovery)
 
 
@@ -2195,19 +2184,9 @@ def single_stock(
 @app.route("/stocks")
 def stocks():
 
-    # ---------------------------------------------------------
-    # SERVER OTORİTESİ
-    # ---------------------------------------------------------
-    # Android eski sürümde yalnızca 19 sembol gönderse bile server
-    # bu listeyi kullanmaz. Her zaman kendi güncel 614 hisselik
-    # BIST evrenini döndürür.
-    #
-    # Böylece:
-    #   /stocks
-    #   /stocks?symbols=AKBNK,ASELS,...
-    # ikisi de serverdaki 614 hisselik evreni kullanır.
-    # ---------------------------------------------------------
-
+    # SERVER OTORITESI:
+    # Android eski sürümde 19 sembol gönderse bile server
+    # kendi 614 hisselik aktif BIST evrenini kullanır.
     symbols = get_bist_symbols()
 
     if not symbols:
@@ -2406,14 +2385,7 @@ if __name__ == "__main__":
     print(
         "SEMBOL:",
         symbol_count,
-        "/",
-        TARGET_BIST_STOCK_COUNT,
         "HISSE"
-    )
-
-    print(
-        "HEDEF HISSE:",
-        TARGET_BIST_STOCK_COUNT
     )
 
     print(
