@@ -7,6 +7,13 @@ import os
 import json
 import re
 import urllib.request
+
+# =========================================================
+# APINOKTAM API KEY
+# =========================================================
+# Gerçek API anahtarını sadece bu satıra yaz.
+APINOKTAM_API_KEY = "ak_live_bb8bd2d307ac905f51429e08a8539ac65f440c13b674830f"
+
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
@@ -1694,6 +1701,7 @@ def start_background_refresh(
     def worker():
 
         global _background_refresh_started
+        nonlocal refresh_symbols
 
         print(
             "YALCIN PRO - ARKA PLAN BASLADI:",
@@ -1918,9 +1926,11 @@ def start_background_refresh(
 
 
 # =============================================================
-# CACHE YÜKLE
+# CACHE / SEMBOL CACHE YÜKLE
 # =============================================================
 
+_load_symbol_cache()
+_load_active_symbol_cache()
 _load_persistent_cache()
 
 
@@ -2342,6 +2352,17 @@ def stocks():
 # =============================================================
 
 if __name__ == "__main__":
+
+    # ---------------------------------------------------------
+    # İLK AÇILIŞTA GÜNCEL BIST EVRENİNİ OLUŞTUR
+    # KAP -> Yahoo doğrulama -> aktif sembol cache
+    # Böylece server açıldığında sembol listesi hazır olur.
+    # ---------------------------------------------------------
+
+    initial_symbols = get_bist_symbols()
+
+    # Fiyat arka planını Android isteğini beklemeden başlat.
+    start_background_refresh(initial_symbols)
 
     with _cache_lock:
 
