@@ -79,6 +79,15 @@ MAX_KAP_SYMBOLS = 1200
 # YALCIN PRO hedef BIST hisse sayisi
 TARGET_BIST_STOCK_COUNT = 614
 
+# 614 hissenin canlı güncelleme durumunu takip et
+last_refresh_stats = {
+    "updated": 0,
+    "missing": 0,
+    "total": 0,
+    "timestamp": 0
+}
+
+
 # KAP listesinin içine zaman zaman karışabilen denetim kuruluşu
 # ve şirket dışı kodlar. Bunlar Yahoo'da BIST hissesi değildir.
 INVALID_SYMBOLS = {
@@ -1753,7 +1762,7 @@ def start_background_refresh(
 
     def worker():
 
-        global _background_refresh_started
+        global _background_refresh_started, last_refresh_stats
         nonlocal refresh_symbols
 
         print(
@@ -1923,6 +1932,13 @@ def start_background_refresh(
                         _stock_cache
                     )
 
+                last_refresh_stats = {
+                    "updated": total_updated,
+                    "missing": total_missing,
+                    "total": len(refresh_symbols),
+                    "timestamp": time.time()
+                }
+
                 print(
                     "YALCIN PRO - YENILEME TAMAMLANDI:",
                     total_updated,
@@ -2027,6 +2043,23 @@ def datetime_now():
 # =============================================================
 # DİNAMİK BIST SEMBOLLERİ
 # =============================================================
+
+@app.route("/stats")
+def stats():
+    """614 hissenin canlı veri güncelleme durumunu gösterir."""
+    symbols = get_bist_symbols()
+    with _cache_lock:
+        cache_count = len(_stock_cache)
+    with _symbol_list_lock:
+        symbol_count = len(_symbol_list)
+    return jsonify({
+        "success": True,
+        "target": TARGET_BIST_STOCK_COUNT,
+        "symbols": len(symbols),
+        "cache": cache_count,
+        "lastRefresh": last_refresh_stats
+    })
+
 
 @app.route("/symbols")
 def symbols():
