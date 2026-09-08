@@ -1,1444 +1,2570 @@
-```
-package com.yalcnpro.ai
+from flask import Flask, jsonify, request
+import yfinance as yf
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import json
+import re
+import urllib.request
 
-import android.content.Intent
-import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
-import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.remember
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.lifecycle.lifecycleScope
-import com.yalcnpro.ai.network.BistStock
-import com.yalcnpro.ai.network.RetrofitClient
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.isActive
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+# =========================================================
+# APINOKTAM API KEY
+# =========================================================
+# Gerçek API anahtarını sadece bu satıra yaz.
+APINOKTAM_API_KEY = "ak_live_bb8bd2d307ac905f51429e08a8539ac65f440c13b674830f"
 
-class MainActivity : ComponentActivity() {
-
-    // =========================================================
-    // ANA STATE
-    // =========================================================
-
-    private var stocks by mutableStateOf<List<BistStock>>(emptyList())
-
-    private var isRefreshing by mutableStateOf(false)
-
-    private var loadError by mutableStateOf("")
-
-    private var lastUpdateTime by mutableStateOf("--:--:--")
-
-    private var serverSymbolCount by mutableStateOf(0)
-
-    private var refreshJob: Job? = null
+from html.parser import HTMLParser
+from zoneinfo import ZoneInfo
 
 
-    // =========================================================
-    // SEMBOL NORMALİZASYONU
-    // =========================================================
+# =============================================================
+# YALCIN PRO - CANLI BIST SERVER
+# =============================================================
 
-    private fun normalizeSymbol(symbol: String?): String {
+app = Flask(__name__)
 
-        return symbol
-            ?.trim()
-            ?.uppercase(Locale.ROOT)
-            ?.removeSuffix(".IS")
-            ?.replace(" ", "")
-            ?: ""
+ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
+
+
+# =============================================================
+# AYARLAR
+# =============================================================
+
+# Yahoo bir istekte kaç hisse işleyecek
+BATCH_SIZE = 25
+
+# Cache kaç saniye taze kabul edilecek
+CACHE_TTL_SECONDS = 20
+
+# Bir yenileme turundan sonra bekleme
+BACKGROUND_REFRESH_SECONDS = 30
+
+# KAP sembol listesini ne kadar sıklıkla yeniden kontrol edeceğiz
+SYMBOL_REFRESH_SECONDS = 300
+
+# İlk geçerli evren için güvenli paralel Yahoo işçisi sayısı
+SYMBOL_DISCOVERY_WORKERS = 4
+
+# Başarısız gruplar için tekrar deneme
+RETRY_COUNT = 1
+
+# Retry arası bekleme
+RETRY_WAIT_SECONDS = 3
+
+# Yahoo intraday
+INTRADAY_PERIOD = "1d"
+INTRADAY_INTERVAL = "5m"
+
+# Önceki kapanış için günlük veri
+DAILY_PERIOD = "5d"
+DAILY_INTERVAL = "1d"
+
+# Kalıcı fiyat cache
+PERSISTENT_CACHE_FILE = "yalcin_pro_cache.json"
+
+# Dinamik sembol cache
+SYMBOL_CACHE_FILE = "yalcin_pro_symbols.json"
+
+# Yahoo'dan doğrulanmış aktif BIST hisseleri
+ACTIVE_SYMBOL_CACHE_FILE = "yalcin_pro_active_symbols.json"
+
+# KAP BIST şirketleri
+KAP_BIST_URL = "https://kap.org.tr/tr/bist-sirketler"
+
+# KAP BIST şirket sayısı için güvenlik sınırı.
+# Liste bu sınırı aşarsa HTML parser tekrar kontrol edilmeden kullanılmaz.
+MAX_KAP_SYMBOLS = 1200
+
+# YALCIN PRO hedef BIST hisse sayisi
+TARGET_BIST_STOCK_COUNT = 614
+
+# 614 hissenin canlı güncelleme durumunu takip et
+last_refresh_stats = {
+    "updated": 0,
+    "missing": 0,
+    "total": 0,
+    "timestamp": 0
+}
+
+
+# KAP listesinin içine zaman zaman karışabilen denetim kuruluşu
+# ve şirket dışı kodlar. Bunlar Yahoo'da BIST hissesi değildir.
+INVALID_SYMBOLS = {
+    "DRT", "PWC", "KPMG", "TTK", "BDO", "PKF",
+    "RSM", "BD", "CNS", "HSY", "KARAR", "REFORM"
+}
+
+
+# =============================================================
+# CACHE
+# =============================================================
+
+_stock_cache = {}
+
+_cache_lock = threading.Lock()
+
+_background_refresh_started = False
+
+_refresh_lock = threading.Lock()
+
+
+# =============================================================
+# DİNAMİK SEMBOL CACHE
+# =============================================================
+
+_symbol_list = []
+
+_symbol_list_lock = threading.Lock()
+
+_last_symbol_refresh = 0.0
+_symbol_refresh_lock = threading.Lock()
+
+
+# =============================================================
+# SEMBOL NORMALİZASYONU
+# =============================================================
+
+def normalize_symbol(symbol):
+
+    if not symbol:
+        return ""
+
+    normalized = (
+        str(symbol)
+        .strip()
+        .upper()
+        .replace(".IS", "")
+        .replace(" ", "")
+    )
+
+    if normalized in INVALID_SYMBOLS:
+        return ""
+
+    return normalized
+
+
+# =============================================================
+# KAP SEMBOL NORMALİZASYONU
+# =============================================================
+
+def normalize_kap_symbol(symbol):
+
+    if not symbol:
+        return ""
+
+    symbol = str(symbol).strip().upper()
+
+    # Bazı KAP linklerinde:
+    #
+    # A1CAP ACP
+    # ALBRK ALK
+    #
+    # gibi ikinci ifade bulunabiliyor.
+    #
+    # İlk parçayı sembol adayı olarak alıyoruz.
+
+    parts = symbol.split()
+
+    if not parts:
+        return ""
+
+    symbol = parts[0]
+
+    symbol = (
+        symbol
+        .replace(".IS", "")
+        .replace(",", "")
+        .replace(";", "")
+        .strip()
+    )
+
+    # BIST sembolleri için güvenli karakter kümesi
+    if not re.fullmatch(
+        r"[A-Z0-9]{2,8}",
+        symbol
+    ):
+        return ""
+
+    return symbol
+
+
+# =============================================================
+# KAP HTML PARSER
+# =============================================================
+
+class KAPSymbolParser(HTMLParser):
+    """
+    KAP BIST şirketleri tablosundan SADECE ilk sütundaki
+    hisse kodunu alır.
+
+    ÖNEMLİ:
+    KAP satırlarında şirket kodunun yanında şirket unvanı, şehir
+    ve bağımsız denetim kuruluşu da bulunabilir. Eski parser
+    link metinlerini taradığı için DRT, PWC, TTK, PKF gibi denetim
+    kuruluşlarını da hisse sembolü sanabiliyordu.
+
+    Bu parser sadece <tr> içindeki ilk <td>/<th> hücresini okur
+    ve o hücredeki İLK geçerli kodu sembol olarak kabul eder.
+    Böylece ikinci kodlar ve denetim kuruluşları listeye girmez.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.in_row = False
+        self.in_cell = False
+        self.cell_index = -1
+        self.current_cell_text = []
+        self.first_cell_text = ""
+        self.symbols = []
+
+    def handle_starttag(self, tag, attrs):
+
+        tag = tag.lower()
+
+        if tag == "tr":
+
+            self.in_row = True
+            self.in_cell = False
+            self.cell_index = -1
+            self.current_cell_text = []
+            self.first_cell_text = ""
+
+            return
+
+        if (
+            self.in_row
+            and tag in ("td", "th")
+        ):
+
+            self.cell_index += 1
+            self.in_cell = True
+            self.current_cell_text = []
+
+    def handle_data(self, data):
+
+        if self.in_row and self.in_cell:
+
+            self.current_cell_text.append(data)
+
+    def handle_endtag(self, tag):
+
+        tag = tag.lower()
+
+        if (
+            self.in_row
+            and self.in_cell
+            and tag in ("td", "th")
+        ):
+
+            if self.cell_index == 0:
+
+                self.first_cell_text = (
+                    " ".join(
+                        self.current_cell_text
+                    )
+                    .strip()
+                )
+
+            self.in_cell = False
+            self.current_cell_text = []
+
+            return
+
+        if tag != "tr" or not self.in_row:
+            return
+
+        raw_code = self.first_cell_text.strip()
+
+        if raw_code:
+
+            tokens = re.findall(
+                r"[A-Z0-9]{2,8}",
+                raw_code.upper()
+            )
+
+            if tokens:
+
+                # İlk sütundaki ilk kod = ana BIST sembolü.
+                candidate = normalize_kap_symbol(
+                    tokens[0]
+                )
+
+                # Tablo başlığının yanlışlıkla sembol olmasını engelle.
+                if (
+                    candidate
+                    and candidate != "KOD"
+                    and candidate not in INVALID_SYMBOLS
+                ):
+
+                    self.symbols.append(
+                        candidate
+                    )
+
+        self.in_row = False
+        self.in_cell = False
+        self.cell_index = -1
+        self.current_cell_text = []
+        self.first_cell_text = ""
+
+
+# =============================================================
+# KAP SEMBOLLERİNİ İNDİR
+# =============================================================
+
+def _download_kap_symbols():
+
+    print(
+        "YALCIN PRO - KAP BIST SEMBOLLERI ALINIYOR..."
+    )
+
+    try:
+
+        req = urllib.request.Request(
+
+            KAP_BIST_URL,
+
+            headers={
+                "User-Agent":
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/120.0 Safari/537.36",
+                "Accept":
+                    "text/html,application/xhtml+xml"
+            }
+        )
+
+        with urllib.request.urlopen(
+            req,
+            timeout=20
+        ) as response:
+
+            html = response.read().decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+        parser = KAPSymbolParser()
+
+        parser.feed(html)
+
+        symbols = list(
+            dict.fromkeys(
+                parser.symbols
+            )
+        )
+
+        print(
+            "YALCIN PRO - KAP HAM SEMBOL:",
+            len(symbols),
+            "HISSE"
+        )
+
+        # KAP sayfası başarısız veya HTML
+        # yapısı değişmişse mevcut listeyi bozma.
+
+        if len(symbols) < 100:
+
+            print(
+                "YALCIN PRO - KAP SEMBOL LISTESI YETERSIZ:",
+                len(symbols)
+            )
+
+            return []
+
+        # Aşırı büyük liste genellikle KAP HTML yapısının yanlış
+        # parse edildiğini gösterir. Eski sürüm 1045 sembol üretiyordu.
+        if len(symbols) > MAX_KAP_SYMBOLS:
+
+            print(
+                "YALCIN PRO - KAP SEMBOL LISTESI SUPHELI:",
+                len(symbols),
+                "HISSE"
+            )
+
+            return []
+
+        print(
+            "YALCIN PRO - KAP SEMBOL LISTESI HAZIR:",
+            len(symbols),
+            "HISSE"
+        )
+
+        return symbols
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - KAP SEMBOL HATASI:",
+            e
+        )
+
+        return []
+
+
+# =============================================================
+# SEMBOL CACHE YÜKLE
+# =============================================================
+
+def _load_symbol_cache():
+
+    global _symbol_list
+
+    try:
+
+        if not os.path.exists(
+            SYMBOL_CACHE_FILE
+        ):
+
+            print(
+                "YALCIN PRO - SEMBOL CACHE DOSYASI YOK"
+            )
+
+            return
+
+        with open(
+            SYMBOL_CACHE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            saved = json.load(f)
+
+        if not isinstance(
+            saved,
+            list
+        ):
+
+            return
+
+        cleaned = []
+
+        for symbol in saved:
+
+            normalized = normalize_symbol(
+                symbol
+            )
+
+            if normalized and normalized not in INVALID_SYMBOLS:
+
+                cleaned.append(
+                    normalized
+                )
+
+        cleaned = list(dict.fromkeys(cleaned))
+
+        # Eski sürümde KAP'ın denetim kuruluşları da sembol olarak
+        # cache'e girmiş olabilir (ör. DRT, PWC). Böyle bir cache'i
+        # kullanma; yeni KAP listesini yeniden oluştur.
+        if len(cleaned) > MAX_KAP_SYMBOLS or any(
+            code in INVALID_SYMBOLS for code in cleaned
+        ):
+            print(
+                "YALCIN PRO - ESKI/GEÇERSIZ SEMBOL CACHE ATILDI:",
+                len(cleaned),
+                "HISSE"
+            )
+
+            # Eski hatalı cache'in tekrar kullanılmasını engelle.
+            try:
+                os.remove(SYMBOL_CACHE_FILE)
+            except Exception:
+                pass
+
+            return
+
+        with _symbol_list_lock:
+            _symbol_list = cleaned
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE YUKLENDI:",
+            len(cleaned),
+            "HISSE"
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE OKUMA HATASI:",
+            e
+        )
+
+
+# =============================================================
+# SEMBOL CACHE KAYDET
+# =============================================================
+
+def _save_symbol_cache(
+    symbols
+):
+
+    try:
+
+        cleaned = []
+
+        for symbol in symbols:
+
+            normalized = normalize_symbol(
+                symbol
+            )
+
+            if normalized and normalized not in INVALID_SYMBOLS:
+
+                cleaned.append(
+                    normalized
+                )
+
+        cleaned = list(
+            dict.fromkeys(
+                cleaned
+            )
+        )
+
+        temp_file = (
+            SYMBOL_CACHE_FILE
+            + ".tmp"
+        )
+
+        with open(
+            temp_file,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                cleaned,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        os.replace(
+            temp_file,
+            SYMBOL_CACHE_FILE
+        )
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE KAYDEDILDI:",
+            len(cleaned)
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - SEMBOL CACHE YAZMA HATASI:",
+            e
+        )
+
+
+# =============================================================
+# BIST SEMBOLLERİNİ GETİR
+# =============================================================
+
+def _load_active_symbol_cache():
+    """Yahoo'dan daha önce doğrulanmış aktif BIST evrenini yükler."""
+    global _symbol_list
+
+    try:
+        if not os.path.exists(ACTIVE_SYMBOL_CACHE_FILE):
+            return []
+
+        with open(ACTIVE_SYMBOL_CACHE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+
+        if not isinstance(saved, list):
+            return []
+
+        cleaned = list(dict.fromkeys(
+            normalize_symbol(s)
+            for s in saved
+            if normalize_symbol(s)
+        ))
+
+        if not cleaned:
+            return []
+
+        # Eski/eksik cache (or. 19 hisse) aktif evren olarak kullanilmaz.
+        if len(cleaned) < TARGET_BIST_STOCK_COUNT:
+            print(
+                "YALCIN PRO - AKTIF CACHE EKSIK:",
+                len(cleaned), "/", TARGET_BIST_STOCK_COUNT,
+                "- YENIDEN KESFEDILECEK"
+            )
+            return []
+
+        cleaned = cleaned[:TARGET_BIST_STOCK_COUNT]
+
+        with _symbol_list_lock:
+            _symbol_list = cleaned
+
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE YUKLENDI:",
+            len(cleaned),
+            "HISSE"
+        )
+
+        return cleaned
+
+    except Exception as e:
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE HATASI:",
+            e
+        )
+        return []
+
+
+def _save_active_symbol_cache(symbols):
+    """Doğrulanmış aktif sembolleri atomik olarak kaydeder."""
+    try:
+        cleaned = list(dict.fromkeys(
+            normalize_symbol(s)
+            for s in symbols
+            if normalize_symbol(s)
+        ))
+
+        if len(cleaned) > TARGET_BIST_STOCK_COUNT:
+            cleaned = cleaned[:TARGET_BIST_STOCK_COUNT]
+
+        temp_file = ACTIVE_SYMBOL_CACHE_FILE + ".tmp"
+
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(
+                cleaned,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        os.replace(temp_file, ACTIVE_SYMBOL_CACHE_FILE)
+
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE KAYDEDILDI:",
+            len(cleaned),
+            "HISSE"
+        )
+
+    except Exception as e:
+        print(
+            "YALCIN PRO - AKTIF SEMBOL CACHE YAZMA HATASI:",
+            e
+        )
+
+
+def _discover_active_symbols_from_kap(kap_symbols):
+    """
+    KAP listesindeki sembolleri Yahoo'dan doğrular.
+    Böylece KAP'taki yatırım/borçlanma/işlem görmeyen benzeri kayıtlar
+    aktif hisse evrenine girmez.
+
+    Başlangıçtaki doğrulanmış evrenin yaklaşık 741 olması beklenir;
+    sayı sabitlenmez. Yeni şirketler eklendiğinde sonraki keşifte otomatik
+    olarak dahil edilir.
+    """
+    candidates = list(dict.fromkeys(
+        normalize_symbol(s)
+        for s in kap_symbols
+        if normalize_symbol(s)
+    ))
+
+    if not candidates:
+        return []
+
+    batches = [
+        candidates[i:i + BATCH_SIZE]
+        for i in range(0, len(candidates), BATCH_SIZE)
+    ]
+
+    active = set()
+
+    print(
+        "YALCIN PRO - SEMBOL DOGRULAMA:",
+        len(candidates),
+        "ADAY |",
+        len(batches),
+        "GRUP |",
+        SYMBOL_DISCOVERY_WORKERS,
+        "ISCI"
+    )
+
+    def check_batch(batch):
+        try:
+            results, missing = get_stocks_batch(batch)
+            return [
+                normalize_symbol(item.get("sembol", ""))
+                for item in results
+                if normalize_symbol(item.get("sembol", ""))
+            ]
+        except Exception as e:
+            print(
+                "YALCIN PRO - SEMBOL DOGRULAMA GRUP HATASI:",
+                e
+            )
+            return []
+
+    with ThreadPoolExecutor(
+        max_workers=SYMBOL_DISCOVERY_WORKERS,
+        thread_name_prefix="yalcin-symbol"
+    ) as executor:
+
+        futures = {
+            executor.submit(check_batch, batch): index
+            for index, batch in enumerate(batches, start=1)
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+            completed += 1
+            index = futures[future]
+
+            try:
+                valid = future.result()
+                active.update(valid)
+                print(
+                    "YALCIN PRO - SEMBOL DOGRULAMA:",
+                    completed,
+                    "/",
+                    len(batches),
+                    "| GRUP:",
+                    index,
+                    "| AKTIF:",
+                    len(active)
+                )
+            except Exception as e:
+                print(
+                    "YALCIN PRO - SEMBOL FUTURE HATASI:",
+                    index,
+                    e
+                )
+
+    # KAP sırasını koru; set sırası kullanma.
+    verified_ordered = [
+        symbol
+        for symbol in candidates
+        if symbol in active
+    ]
+
+    # Yahoo bazı geçerli BIST sembollerini geçici olarak döndürmeyebilir.
+    # Ana evrenin 614 hissede kalması için doğrulanamayan KAP
+    # sembollerini tamamlayıcı olarak ekliyoruz. Bu hisselerin fiyatı
+    # o anda yoksa /stocks içinde 0.0 ile korunur; arka plan yenilemesi
+    # sonraki turlarda gerçek fiyatı tekrar dener.
+    ordered = verified_ordered[:TARGET_BIST_STOCK_COUNT]
+
+    if len(ordered) < TARGET_BIST_STOCK_COUNT:
+        verified_set = set(ordered)
+        fallback_symbols = [
+            symbol
+            for symbol in candidates
+            if symbol not in verified_set
+        ]
+
+        needed = TARGET_BIST_STOCK_COUNT - len(ordered)
+        ordered.extend(fallback_symbols[:needed])
+
+        print(
+            "YALCIN PRO - KAP TAMAMLAMA:",
+            min(len(fallback_symbols), needed),
+            "EK SEMBOL | DOGRULANMIS:",
+            len(verified_ordered),
+            "| HEDEF:",
+            TARGET_BIST_STOCK_COUNT
+        )
+
+    if len(ordered) > TARGET_BIST_STOCK_COUNT:
+        ordered = ordered[:TARGET_BIST_STOCK_COUNT]
+
+    print(
+        "YALCIN PRO - AKTIF BIST EVRENI:",
+        len(ordered),
+        "/", TARGET_BIST_STOCK_COUNT,
+        "HISSE | YAHOO DOGRULANMIS:",
+        len(verified_ordered)
+    )
+
+    return ordered
+
+def _refresh_symbol_universe(force=False):
+    """KAP listesini periyodik olarak yeniden alır ve Yahoo ile doğrular."""
+    global _last_symbol_refresh, _symbol_list
+
+    now = time.time()
+
+    with _symbol_refresh_lock:
+        if (
+            not force
+            and _last_symbol_refresh > 0
+            and now - _last_symbol_refresh < SYMBOL_REFRESH_SECONDS
+        ):
+            with _symbol_list_lock:
+                return list(_symbol_list)
+
+        # Başka bir istek keşif yapıyorsa ikinci kez yapma.
+        _last_symbol_refresh = now
+
+    kap_symbols = _download_kap_symbols()
+
+    if not kap_symbols:
+        with _symbol_list_lock:
+            return list(_symbol_list)
+
+    active = _discover_active_symbols_from_kap(kap_symbols)
+
+    if not active:
+        with _symbol_list_lock:
+            return list(_symbol_list)
+
+    with _symbol_list_lock:
+        old = list(_symbol_list)
+        _symbol_list = active
+
+    _save_active_symbol_cache(active)
+    _save_symbol_cache(kap_symbols)
+
+    added = [s for s in active if s not in old]
+    removed = [s for s in old if s not in active]
+
+    print(
+        "YALCIN PRO - SEMBOL EVRENI GUNCELLENDI:",
+        len(active),
+        "HISSE | YENI:",
+        len(added),
+        "CIKAN:",
+        len(removed)
+    )
+
+    return active
+
+
+def get_bist_symbols():
+    """
+    Server'ın Android'e vereceği ana BIST evrenini döndürür.
+    Evren 614 ile sınırlandırılır; fiyatı henüz cache'e gelmemiş
+    semboller de listeden çıkarılmaz.
+    """
+    with _symbol_list_lock:
+        current = list(_symbol_list)
+
+    if not current:
+        current = _load_active_symbol_cache()
+
+    if len(current) > TARGET_BIST_STOCK_COUNT:
+        current = current[:TARGET_BIST_STOCK_COUNT]
+
+    return current
+
+
+# =============================================================
+# FİYAT CACHE DOSYASINI YÜKLE
+# =============================================================
+
+def _load_persistent_cache():
+
+    global _stock_cache
+
+    try:
+
+        if not os.path.exists(
+            PERSISTENT_CACHE_FILE
+        ):
+
+            print(
+                "YALCIN PRO - KALICI CACHE DOSYASI YOK"
+            )
+
+            return
+
+        with open(
+            PERSISTENT_CACHE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            saved = json.load(f)
+
+        loaded = 0
+
+        with _cache_lock:
+
+            for symbol, item in saved.items():
+
+                try:
+
+                    if (
+                        isinstance(
+                            item,
+                            list
+                        )
+                        and
+                        len(item) == 2
+                        and
+                        isinstance(
+                            item[1],
+                            dict
+                        )
+                    ):
+
+                        normalized = (
+                            normalize_symbol(
+                                symbol
+                            )
+                        )
+
+                        if not normalized:
+
+                            continue
+
+                        timestamp = float(
+                            item[0]
+                        )
+
+                        result = item[1]
+
+                        _stock_cache[
+                            normalized
+                        ] = (
+                            timestamp,
+                            result
+                        )
+
+                        loaded += 1
+
+                except Exception:
+
+                    continue
+
+        print(
+            "YALCIN PRO - KALICI CACHE YUKLENDI:",
+            loaded,
+            "HISSE"
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - CACHE OKUMA HATASI:",
+            e
+        )
+
+
+# =============================================================
+# FİYAT CACHE DOSYASINI KAYDET
+# =============================================================
+
+def _save_persistent_cache():
+
+    try:
+
+        with _cache_lock:
+
+            data = {
+
+                symbol: [
+                    timestamp,
+                    result
+                ]
+
+                for symbol, (
+                    timestamp,
+                    result
+                )
+                in _stock_cache.items()
+
+            }
+
+        temp_file = (
+            PERSISTENT_CACHE_FILE
+            + ".tmp"
+        )
+
+        with open(
+            temp_file,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                ensure_ascii=False
+            )
+
+        os.replace(
+            temp_file,
+            PERSISTENT_CACHE_FILE
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - CACHE YAZMA HATASI:",
+            e
+        )
+
+
+# =============================================================
+# CACHE OKU
+# =============================================================
+
+def _get_cache(
+    symbol
+):
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+    if not symbol:
+
+        return None, False
+
+    now = time.time()
+
+    with _cache_lock:
+
+        item = _stock_cache.get(
+            symbol
+        )
+
+        if not item:
+
+            return None, False
+
+        timestamp, result = item
+
+    age = (
+        now
+        - timestamp
+    )
+
+    fresh = (
+        age
+        < CACHE_TTL_SECONDS
+    )
+
+    return result, fresh
+
+
+# =============================================================
+# CACHE YAZ
+# =============================================================
+
+def _save_stock_memory(
+    symbol,
+    result
+):
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+    if not symbol or not result:
+
+        return
+
+    with _cache_lock:
+
+        _stock_cache[
+            symbol
+        ] = (
+            time.time(),
+            result
+        )
+
+
+# =============================================================
+# YAHOO CLOSE ÇIKAR
+# =============================================================
+
+def _extract_close(
+    data,
+    ticker_name
+):
+
+    if data is None:
+
+        return None
+
+    try:
+
+        if data.empty:
+
+            return None
+
+    except Exception:
+
+        return None
+
+    try:
+
+        # -----------------------------------------------------
+        # MULTI INDEX
+        # -----------------------------------------------------
+
+        if hasattr(
+            data.columns,
+            "levels"
+        ):
+
+            level0 = (
+                data.columns
+                .get_level_values(0)
+            )
+
+            level1 = (
+                data.columns
+                .get_level_values(1)
+            )
+
+            # -------------------------------------------------
+            # Ticker -> Close
+            # -------------------------------------------------
+
+            if ticker_name in level0:
+
+                ticker_data = data[
+                    ticker_name
+                ]
+
+                if (
+                    hasattr(
+                        ticker_data,
+                        "columns"
+                    )
+                    and
+                    "Close"
+                    in ticker_data.columns
+                ):
+
+                    return (
+                        ticker_data[
+                            "Close"
+                        ]
+                        .dropna()
+                    )
+
+            # -------------------------------------------------
+            # Close -> Ticker
+            # -------------------------------------------------
+
+            if (
+                "Close"
+                in level0
+                and
+                ticker_name
+                in level1
+            ):
+
+                return (
+                    data[
+                        "Close"
+                    ][
+                        ticker_name
+                    ]
+                    .dropna()
+                )
+
+        # -----------------------------------------------------
+        # NORMAL DATA
+        # -----------------------------------------------------
+
+        if "Close" in data.columns:
+
+            return (
+                data["Close"]
+                .dropna()
+            )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - CLOSE OKUMA HATASI:",
+            ticker_name,
+            e
+        )
+
+    return None
+
+
+# =============================================================
+# SONUÇ OLUŞTUR
+# =============================================================
+
+def _make_result(
+    symbol,
+    closes,
+    previous_close=None
+):
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+    if not symbol:
+
+        return None
+
+    if closes is None:
+
+        return None
+
+    try:
+
+        closes = closes.dropna()
+
+    except Exception:
+
+        return None
+
+    if closes.empty:
+
+        return None
+
+    # ---------------------------------------------------------
+    # SON FİYAT
+    # ---------------------------------------------------------
+
+    try:
+
+        price = float(
+            closes.iloc[-1]
+        )
+
+    except Exception:
+
+        return None
+
+    if price <= 0:
+
+        return None
+
+    # ---------------------------------------------------------
+    # ÖNCEKİ KAPANIŞ
+    # ---------------------------------------------------------
+
+    previous = None
+
+    # ---------------------------------------------------------
+    # 1 - Günlük veri
+    # ---------------------------------------------------------
+
+    if previous_close is not None:
+
+        try:
+
+            value = float(
+                previous_close
+            )
+
+            if value > 0:
+
+                previous = value
+
+        except Exception:
+
+            previous = None
+
+    # ---------------------------------------------------------
+    # 2 - Intraday içinden önceki gün
+    # ---------------------------------------------------------
+
+    if previous is None:
+
+        try:
+
+            if hasattr(
+                closes.index,
+                "date"
+            ):
+
+                dates = list(
+                    dict.fromkeys(
+                        closes.index.date
+                    )
+                )
+
+                if len(dates) >= 2:
+
+                    previous_date = (
+                        dates[-2]
+                    )
+
+                    previous_values = (
+                        closes[
+                            closes.index.date
+                            == previous_date
+                        ]
+                    )
+
+                    if not previous_values.empty:
+
+                        value = float(
+                            previous_values.iloc[-1]
+                        )
+
+                        if value > 0:
+
+                            previous = value
+
+        except Exception:
+
+            previous = None
+
+    # ---------------------------------------------------------
+    # 3 - Son çare
+    # ---------------------------------------------------------
+
+    if previous is None:
+
+        previous = price
+
+    # ---------------------------------------------------------
+    # DEĞİŞİM %
+    # ---------------------------------------------------------
+
+    try:
+
+        if previous > 0:
+
+            change = (
+                (price - previous)
+                / previous
+                * 100.0
+            )
+
+        else:
+
+            change = 0.0
+
+    except Exception:
+
+        change = 0.0
+
+    # ---------------------------------------------------------
+    # Çok küçük değerleri temizle
+    # ---------------------------------------------------------
+
+    if abs(change) < 0.000001:
+
+        change = 0.0
+
+    # ---------------------------------------------------------
+    # SONUÇ
+    # ---------------------------------------------------------
+
+    return {
+
+        "sembol":
+            symbol,
+
+        "fiyat":
+            round(
+                price,
+                2
+            ),
+
+        "oncekiKapanis":
+            round(
+                previous,
+                2
+            ),
+
+        "degisimYuzde":
+            round(
+                change,
+                2
+            ),
+
+        "paraBirimi":
+            "TRY"
+
     }
 
 
-    // =========================================================
-    // AI ANALİZİ
-    // =========================================================
+# =============================================================
+# TOPLU HİSSELER - YAHOO
+# =============================================================
 
-    data class AiAnalysis(
-        val signal: String,
-        val confidence: Int,
-        val risk: String
+def get_stocks_batch(
+    symbols
+):
+
+    symbols = [
+        normalize_symbol(s)
+        for s in symbols
+        if normalize_symbol(s)
+    ]
+
+    symbols = list(
+        dict.fromkeys(symbols)
+    )
+
+    if not symbols:
+        return [], []
+
+    results = []
+    missing = []
+
+    tickers = [
+        symbol + ".IS"
+        for symbol in symbols
+    ]
+
+    try:
+
+        print(
+            "YALCIN PRO - TOPLU YAHOO:",
+            len(tickers),
+            "HISSE"
+        )
+
+        # -----------------------------------------------------
+        # INTRADAY
+        # -----------------------------------------------------
+
+        intraday_data = yf.download(
+            tickers=tickers,
+            period=INTRADAY_PERIOD,
+            interval=INTRADAY_INTERVAL,
+            group_by="ticker",
+            auto_adjust=False,
+            prepost=False,
+            threads=True,
+            progress=False
+        )
+
+        # -----------------------------------------------------
+        # GÜNLÜK
+        # -----------------------------------------------------
+
+        daily_data = yf.download(
+            tickers=tickers,
+            period=DAILY_PERIOD,
+            interval=DAILY_INTERVAL,
+            group_by="ticker",
+            auto_adjust=False,
+            prepost=False,
+            threads=True,
+            progress=False
+        )
+
+        # -----------------------------------------------------
+        # HİSSELER
+        # -----------------------------------------------------
+
+        for symbol in symbols:
+
+            ticker_name = symbol + ".IS"
+
+            try:
+
+                closes = _extract_close(
+                    intraday_data,
+                    ticker_name
+                )
+
+                if (
+                    closes is None
+                    or closes.empty
+                ):
+
+                    closes = _extract_close(
+                        daily_data,
+                        ticker_name
+                    )
+
+                if (
+                    closes is None
+                    or closes.empty
+                ):
+
+                    missing.append(symbol)
+                    continue
+
+                daily_closes = _extract_close(
+                    daily_data,
+                    ticker_name
+                )
+
+                previous_close = None
+
+                if (
+                    daily_closes is not None
+                    and not daily_closes.empty
+                ):
+
+                    daily_closes = daily_closes.dropna()
+
+                    if len(daily_closes) >= 2:
+
+                        try:
+
+                            value = float(
+                                daily_closes.iloc[-2]
+                            )
+
+                            if value > 0:
+                                previous_close = value
+
+                        except Exception:
+                            previous_close = None
+
+                result = _make_result(
+                    symbol,
+                    closes,
+                    previous_close
+                )
+
+                if result:
+                    results.append(result)
+                else:
+                    missing.append(symbol)
+
+            except Exception as e:
+
+                print(
+                    "YALCIN PRO - HISSE HATASI:",
+                    symbol,
+                    e
+                )
+
+                missing.append(symbol)
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - TOPLU YAHOO HATASI:",
+            e
+        )
+
+        return [], list(symbols)
+
+    print(
+        "YALCIN PRO - GRUP SONUCU:",
+        len(results),
+        "/",
+        len(symbols),
+        "| EKSIK:",
+        len(missing)
+    )
+
+    return results, missing
+
+
+# =============================================================
+# TEK HİSSE - YAHOO
+# =============================================================
+
+def get_stock_from_yahoo(
+    symbol
+):
+
+    symbol = normalize_symbol(
+        symbol
+    )
+
+    if not symbol:
+
+        return None
+
+    ticker_name = (
+        symbol + ".IS"
+    )
+
+    try:
+
+        print(
+            "YALCIN PRO - TEK YAHOO:",
+            ticker_name
+        )
+
+        # -----------------------------------------------------
+        # INTRADAY
+        # -----------------------------------------------------
+
+        intraday = yf.download(
+
+            tickers=ticker_name,
+
+            period=INTRADAY_PERIOD,
+
+            interval=INTRADAY_INTERVAL,
+
+            auto_adjust=False,
+
+            prepost=False,
+
+            threads=False,
+
+            progress=False
+
+        )
+
+        closes = _extract_close(
+
+            intraday,
+
+            ticker_name
+
+        )
+
+        # -----------------------------------------------------
+        # GÜNLÜK
+        # -----------------------------------------------------
+
+        daily = yf.download(
+
+            tickers=ticker_name,
+
+            period=DAILY_PERIOD,
+
+            interval=DAILY_INTERVAL,
+
+            auto_adjust=False,
+
+            prepost=False,
+
+            threads=False,
+
+            progress=False
+
+        )
+
+        daily_closes = _extract_close(
+
+            daily,
+
+            ticker_name
+
+        )
+
+        # -----------------------------------------------------
+        # INTRADAY YOKSA GÜNLÜK
+        # -----------------------------------------------------
+
+        if (
+            closes is None
+            or
+            closes.empty
+        ):
+
+            closes = daily_closes
+
+        if (
+            closes is None
+            or
+            closes.empty
+        ):
+
+            print(
+                "YALCIN PRO - VERI YOK:",
+                symbol
+            )
+
+            return None
+
+        # -----------------------------------------------------
+        # ÖNCEKİ KAPANIŞ
+        # -----------------------------------------------------
+
+        previous_close = None
+
+        if (
+            daily_closes is not None
+            and
+            not daily_closes.empty
+        ):
+
+            daily_closes = (
+                daily_closes
+                .dropna()
+            )
+
+            if len(
+                daily_closes
+            ) >= 2:
+
+                try:
+
+                    previous_close = float(
+                        daily_closes.iloc[-2]
+                    )
+
+                    if previous_close <= 0:
+
+                        previous_close = None
+
+                except Exception:
+
+                    previous_close = None
+
+        # -----------------------------------------------------
+        # SONUÇ
+        # -----------------------------------------------------
+
+        return _make_result(
+
+            symbol,
+
+            closes,
+
+            previous_close
+
+        )
+
+    except Exception as e:
+
+        print(
+            "YALCIN PRO - YAHOO HATASI:",
+            symbol,
+            e
+        )
+
+        return None
+
+
+# =============================================================
+# ARKA PLAN YENİLEME
+# =============================================================
+
+def start_background_refresh(
+    symbols
+):
+
+    global _background_refresh_started
+
+    refresh_symbols = list(
+        dict.fromkeys(
+
+            normalize_symbol(s)
+
+            for s in symbols
+
+            if normalize_symbol(s)
+
+        )
+    )
+
+    if not refresh_symbols:
+
+        return
+
+    with _refresh_lock:
+
+        if _background_refresh_started:
+
+            return
+
+        _background_refresh_started = True
+
+    def worker():
+
+        global _background_refresh_started, last_refresh_stats
+        nonlocal refresh_symbols
+
+        print(
+            "YALCIN PRO - ARKA PLAN BASLADI:",
+            len(refresh_symbols),
+            "HISSE"
+        )
+
+        while True:
+
+            try:
+
+                # -------------------------------------------------
+                # GÜNCEL BIST EVRENİNİ KONTROL ET
+                # Yeni eklenen hisseler otomatik dahil edilir.
+                # -------------------------------------------------
+
+                latest_symbols = _refresh_symbol_universe()
+
+                if latest_symbols:
+                    refresh_symbols = list(latest_symbols)
+
+                # -------------------------------------------------
+                # GRUPLARI OLUŞTUR
+                # -------------------------------------------------
+
+                batches = [
+
+                    refresh_symbols[
+                        i:i + BATCH_SIZE
+                    ]
+
+                    for i in range(
+                        0,
+                        len(refresh_symbols),
+                        BATCH_SIZE
+                    )
+
+                ]
+
+                total_updated = 0
+
+                total_missing = 0
+
+                print(
+                    "YALCIN PRO - YENILEME TURU:",
+                    len(batches),
+                    "GRUP"
+                )
+
+                # -------------------------------------------------
+                # -------------------------------------------------
+                # TÜM GRUPLARI KONTROLLÜ PARALEL YENİLE
+                # -------------------------------------------------
+                # 25 grup artık 4 işçiyle aynı anda çalışır.
+                # Böylece listenin sonundaki VERUS gibi hisseler
+                # ilk grubun bitmesini beklemez.
+                # -------------------------------------------------
+
+                def refresh_one_batch(index, batch):
+                    print(
+                        "YALCIN PRO - GRUP:",
+                        index,
+                        "/",
+                        len(batches),
+                        "|",
+                        len(batch),
+                        "HISSE"
+                    )
+
+                    for retry in range(RETRY_COUNT + 1):
+                        try:
+                            results, missing = get_stocks_batch(batch)
+
+                            for result in results:
+                                symbol = normalize_symbol(
+                                    result.get("sembol", "")
+                                )
+
+                                if symbol:
+                                    _save_stock_memory(
+                                        symbol,
+                                        result
+                                    )
+
+                            print(
+                                "YALCIN PRO - GRUP TAMAM:",
+                                index,
+                                "| GUNCEL:",
+                                len(results),
+                                "| EKSIK:",
+                                len(missing),
+                                "| DENEME:",
+                                retry + 1
+                            )
+
+                            return len(results), len(missing)
+
+                        except Exception as e:
+                            print(
+                                "YALCIN PRO - GRUP HATASI:",
+                                index,
+                                "| DENEME:",
+                                retry + 1,
+                                e
+                            )
+
+                            if retry < RETRY_COUNT:
+                                time.sleep(RETRY_WAIT_SECONDS)
+
+                    print(
+                        "YALCIN PRO - GRUP BASARISIZ:",
+                        index,
+                        "| HISSE:",
+                        len(batch)
+                    )
+
+                    return 0, len(batch)
+
+                with ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix="yalcin-price"
+                ) as executor:
+
+                    futures = {
+                        executor.submit(
+                            refresh_one_batch,
+                            index,
+                            batch
+                        ): index
+                        for index, batch in enumerate(
+                            batches,
+                            start=1
+                        )
+                    }
+
+                    for future in as_completed(futures):
+                        index = futures[future]
+
+                        try:
+                            updated, missing = future.result()
+                            total_updated += updated
+                            total_missing += missing
+
+                        except Exception as e:
+                            print(
+                                "YALCIN PRO - GRUP FUTURE HATASI:",
+                                index,
+                                e
+                            )
+                            total_missing += len(
+                                batches[index - 1]
+                            )
+
+                # CACHE DOSYASINI TEK SEFERDE KAYDET
+                # -------------------------------------------------
+
+                _save_persistent_cache()
+
+                # -------------------------------------------------
+                # CACHE DURUMU
+                # -------------------------------------------------
+
+                with _cache_lock:
+
+                    cache_count = len(
+                        _stock_cache
+                    )
+
+                last_refresh_stats = {
+                    "updated": total_updated,
+                    "missing": total_missing,
+                    "total": len(refresh_symbols),
+                    "timestamp": time.time()
+                }
+
+                print(
+                    "YALCIN PRO - YENILEME TAMAMLANDI:",
+                    total_updated,
+                    "/",
+                    len(refresh_symbols),
+                    "| CACHE:",
+                    cache_count,
+                    "| EKSIK:",
+                    total_missing
+                )
+
+                print(
+                    "YALCIN PRO - 614 HISSE TURU BİTTİ | "
+                    "GUNCELLENEN:",
+                    total_updated,
+                    "/",
+                    len(refresh_symbols)
+                )
+
+                # -------------------------------------------------
+                # SONRAKİ TUR
+                # -------------------------------------------------
+
+                time.sleep(
+                    BACKGROUND_REFRESH_SECONDS
+                )
+
+            except Exception as e:
+
+                print(
+                    "YALCIN PRO - ARKA PLAN HATASI:",
+                    e
+                )
+
+                time.sleep(5)
+
+    thread = threading.Thread(
+
+        target=worker,
+
+        daemon=True,
+
+        name="yalcin-cache-refresh"
+
+    )
+
+    thread.start()
+
+
+# =============================================================
+# CACHE / SEMBOL CACHE YÜKLE
+# =============================================================
+
+_load_symbol_cache()
+_load_active_symbol_cache()
+_load_persistent_cache()
+
+
+# =============================================================
+# HEALTH
+# =============================================================
+
+@app.route("/health")
+def health():
+
+    with _cache_lock:
+
+        cache_count = len(
+            _stock_cache
+        )
+
+    with _symbol_list_lock:
+
+        symbol_count = len(
+            _symbol_list
+        )
+
+    return jsonify({
+
+        "success":
+            True,
+
+        "status":
+            "online",
+
+        "cache":
+            cache_count,
+
+        "symbols":
+            symbol_count,
+
+        "serverTime":
+            datetime_now()
+
+    })
+
+
+# =============================================================
+# ZAMAN
+# =============================================================
+
+def datetime_now():
+
+    return time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.localtime()
     )
 
 
-    private fun analyzeStock(
-        change: Double?
-    ): AiAnalysis {
+# =============================================================
+# DİNAMİK BIST SEMBOLLERİ
+# =============================================================
 
-        if (change == null) {
+@app.route("/stats")
+def stats():
+    """614 hissenin canlı veri güncelleme durumunu gösterir."""
+    symbols = get_bist_symbols()
+    with _cache_lock:
+        cache_count = len(_stock_cache)
+    with _symbol_list_lock:
+        symbol_count = len(_symbol_list)
+    return jsonify({
+        "success": True,
+        "target": TARGET_BIST_STOCK_COUNT,
+        "symbols": len(symbols),
+        "cache": cache_count,
+        "lastRefresh": last_refresh_stats
+    })
 
-            return AiAnalysis(
-                signal = "VERİ YOK",
-                confidence = 0,
-                risk = "Bekleniyor"
-            )
-        }
 
-        return when {
+@app.route("/symbols")
+def symbols():
 
-            change >= 3.0 -> {
+    symbol_list = (
+        get_bist_symbols()
+    )
 
-                AiAnalysis(
-                    signal = "GÜÇLÜ AL",
-                    confidence = 95,
-                    risk = "Düşük"
+    if not symbol_list:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "count":
+                0,
+
+            "symbols":
+                [],
+
+            "error":
+                "BIST sembol listesi alınamadı"
+
+        }), 503
+
+    return jsonify({
+
+        "success":
+            True,
+
+        "count":
+            len(symbol_list),
+
+        "symbols":
+            symbol_list
+
+    })
+
+
+# =============================================================
+# TEK HİSSE
+# =============================================================
+
+@app.route(
+    "/stock/<sembol>"
+)
+def single_stock(
+    sembol
+):
+
+    symbol = normalize_symbol(
+        sembol
+    )
+
+    if not symbol:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "data":
+                []
+
+        }), 400
+
+    result, fresh = _get_cache(
+        symbol
+    )
+
+    # ---------------------------------------------------------
+    # CACHE TAZE
+    # ---------------------------------------------------------
+
+    if (
+        result is not None
+        and
+        fresh
+    ):
+
+        return jsonify({
+
+            "success":
+                True,
+
+            "data": [
+                result
+            ]
+
+        })
+
+    # ---------------------------------------------------------
+    # CACHE ESKİYSE ARKA PLANDA GÜNCELLE
+    # ---------------------------------------------------------
+
+    def update_one():
+
+        try:
+
+            new_result = (
+                get_stock_from_yahoo(
+                    symbol
                 )
-            }
-
-            change >= 1.0 -> {
-
-                val confidence =
-                    (
-                            75.0 +
-                                    ((change - 1.0) / 2.0 * 14.0)
-                            )
-                        .toInt()
-                        .coerceIn(75, 89)
-
-                AiAnalysis(
-                    signal = "AL",
-                    confidence = confidence,
-                    risk = "Orta"
-                )
-            }
-
-            change >= 0.25 -> {
-
-                val confidence =
-                    (
-                            60.0 +
-                                    ((change - 0.25) / 0.75 * 14.0)
-                            )
-                        .toInt()
-                        .coerceIn(60, 74)
-
-                AiAnalysis(
-                    signal = "ZAYIF AL",
-                    confidence = confidence,
-                    risk = "Orta"
-                )
-            }
-
-            change > -0.25 -> {
-
-                AiAnalysis(
-                    signal = "BEKLE",
-                    confidence = 55,
-                    risk = "Orta"
-                )
-            }
-
-            change > -1.0 -> {
-
-                val confidence =
-                    (
-                            60.0 +
-                                    ((-change - 0.25) / 0.75 * 14.0)
-                            )
-                        .toInt()
-                        .coerceIn(60, 74)
-
-                AiAnalysis(
-                    signal = "ZAYIF SAT",
-                    confidence = confidence,
-                    risk = "Orta"
-                )
-            }
-
-            change > -3.0 -> {
-
-                val confidence =
-                    (
-                            75.0 +
-                                    ((-change - 1.0) / 2.0 * 14.0)
-                            )
-                        .toInt()
-                        .coerceIn(75, 89)
-
-                AiAnalysis(
-                    signal = "SAT",
-                    confidence = confidence,
-                    risk = "Yüksek"
-                )
-            }
-
-            else -> {
-
-                AiAnalysis(
-                    signal = "GÜÇLÜ SAT",
-                    confidence = 95,
-                    risk = "Yüksek"
-                )
-            }
-        }
-    }
-
-
-    // =========================================================
-    // ACTIVITY
-    // =========================================================
-
-    override fun onCreate(
-        savedInstanceState: Bundle?
-    ) {
-
-        super.onCreate(savedInstanceState)
-
-
-        // =====================================================
-        // UI
-        // =====================================================
-
-        setContent {
-
-            MaterialTheme {
-
-                var searchText by remember {
-                    mutableStateOf("")
-                }
-
-                var sortOption by remember {
-                    mutableStateOf("Varsayılan")
-                }
-
-                // =================================================
-                // AŞAĞI ÇEKEREK MANUEL YENİLEME
-                // =================================================
-                val pullToRefreshState =
-                    rememberPullToRefreshState()
-
-
-                // =================================================
-                // SERVER'DAN GELEN TÜM HİSSELERİ KULLAN
-                // =================================================
-                // Android artık BistSymbols listesini ekranı
-                // 438 hisseye sınırlamak için kullanmıyor.
-                // Server kaç hisse gönderirse tamamı gösterilir.
-
-                val allStocks =
-                    remember(stocks) {
-                        stocks
-                            .filter {
-                                it.sembol.isNotBlank()
-                            }
-                            .distinctBy {
-                                normalizeSymbol(it.sembol)
-                            }
-                    }
-
-
-                // =================================================
-                // ARAMA + SIRALAMA
-                // =================================================
-
-                val filteredStocks =
-                    remember(
-                        searchText,
-                        sortOption,
-                        allStocks
-                    ) {
-
-                        var result =
-                            allStocks.filter {
-
-                                it.sembol.contains(
-                                    searchText,
-                                    ignoreCase = true
-                                )
-                            }
-
-
-                        result =
-                            when (sortOption) {
-
-                                "Artan" -> {
-
-                                    result.sortedByDescending {
-                                        it.degisimYuzde
-                                    }
-                                }
-
-                                "Düşen" -> {
-
-                                    result.sortedBy {
-                                        it.degisimYuzde
-                                    }
-                                }
-
-                                "Alfabetik" -> {
-
-                                    result.sortedBy {
-                                        it.sembol
-                                    }
-                                }
-
-                                else -> {
-
-                                    result
-                                }
-                            }
-
-
-                        result
-                    }
-
-
-                // =================================================
-                // ANA EKRAN
-                // =================================================
-
-                Scaffold(
-                    modifier =
-                        Modifier.fillMaxSize()
-                ) { innerPadding ->
-
-                    Column(
-
-                        modifier =
-                            Modifier
-                                .fillMaxSize()
-                                .padding(
-                                    innerPadding
-                                )
-                                .padding(16.dp)
-                    ) {
-
-                        Text(
-
-                            text =
-                                "Yalçın Pro Borsa",
-
-                            fontSize =
-                                28.sp,
-
-                            fontWeight =
-                                FontWeight.Bold
-                        )
-
-
-                        Spacer(
-                            modifier =
-                                Modifier.height(4.dp)
-                        )
-
-
-                        Text(
-
-                            text =
-                                "Canlı BIST Piyasası",
-
-                            fontSize =
-                                14.sp,
-
-                            color =
-                                MaterialTheme
-                                    .colorScheme
-                                    .onSurfaceVariant
-                        )
-
-
-                        Spacer(
-                            modifier =
-                                Modifier.height(8.dp)
-                        )
-
-
-                        // =================================================
-                        // DURUM
-                        // =================================================
-
-                        Text(
-
-                            text =
-                                if (isRefreshing) {
-
-                                    "● Fiyatlar güncelleniyor..."
-
-                                } else {
-
-                                    "● Son güncelleme: $lastUpdateTime"
-                                },
-
-                            fontSize =
-                                13.sp,
-
-                            color =
-                                if (isRefreshing) {
-
-                                    Color(0xFFFF9800)
-
-                                } else {
-
-                                    Color(0xFF16803C)
-                                }
-                        )
-
-
-                        Spacer(
-                            modifier =
-                                Modifier.height(4.dp)
-                        )
-
-
-                        Text(
-
-                            text =
-                                "Gösterilen: ${filteredStocks.size} / ${serverSymbolCount} hisse",
-
-                            fontSize =
-                                14.sp,
-
-                            fontWeight =
-                                FontWeight.Medium
-                        )
-
-
-                        if (
-                            loadError.isNotBlank()
-                        ) {
-
-                            Spacer(
-                                modifier =
-                                    Modifier.height(4.dp)
-                            )
-
-                            Text(
-
-                                text =
-                                    "Hata: $loadError",
-
-                                color =
-                                    Color(0xFFD32F2F),
-
-                                fontSize =
-                                    12.sp
-                            )
-                        }
-
-
-                        Spacer(
-                            modifier =
-                                Modifier.height(10.dp)
-                        )
-
-
-                        // =================================================
-                        // YENİLE + SIRALAMA
-                        // =================================================
-
-                        Row(
-
-                            modifier =
-                                Modifier.fillMaxWidth(),
-
-                            horizontalArrangement =
-                                Arrangement.spacedBy(6.dp)
-                        ) {
-
-                            Button(
-
-                                modifier =
-                                    Modifier.weight(1f),
-
-                                enabled =
-                                    !isRefreshing,
-
-                                onClick = {
-
-                                    lifecycleScope.launch {
-
-                                        refreshStocks()
-                                    }
-                                }
-
-                            ) {
-
-                                Text(
-                                    "↻ YENİLE",
-                                    fontSize = 12.sp
-                                )
-                            }
-
-
-                            Button(
-
-                                modifier =
-                                    Modifier.weight(1f),
-
-                                onClick = {
-
-                                    sortOption =
-                                        "Artan"
-                                }
-
-                            ) {
-
-                                Text(
-                                    "↑ Artan",
-                                    fontSize = 12.sp
-                                )
-                            }
-
-
-                            Button(
-
-                                modifier =
-                                    Modifier.weight(1f),
-
-                                onClick = {
-
-                                    sortOption =
-                                        "Düşen"
-                                }
-
-                            ) {
-
-                                Text(
-                                    "↓ Düşen",
-                                    fontSize = 12.sp
-                                )
-                            }
-                        }
-
-
-                        Spacer(
-                            modifier =
-                                Modifier.height(6.dp)
-                        )
-
-
-                        Row(
-
-                            modifier =
-                                Modifier.fillMaxWidth(),
-
-                            horizontalArrangement =
-                                Arrangement.spacedBy(6.dp)
-                        ) {
-
-                            Button(
-
-                                modifier =
-                                    Modifier.weight(1f),
-
-                                onClick = {
-
-                                    sortOption =
-                                        "Alfabetik"
-                                }
-
-                            ) {
-
-                                Text(
-                                    "A-Z",
-                                    fontSize = 12.sp
-                                )
-                            }
-
-
-                            Button(
-
-                                modifier =
-                                    Modifier.weight(1f),
-
-                                onClick = {
-
-                                    sortOption =
-                                        "Varsayılan"
-                                }
-
-                            ) {
-
-                                Text(
-                                    "Varsayılan",
-                                    fontSize = 12.sp
-                                )
-                            }
-                        }
-
-
-                        Spacer(
-                            modifier =
-                                Modifier.height(8.dp)
-                        )
-
-
-                        // =================================================
-                        // ARAMA
-                        // =================================================
-
-                        OutlinedTextField(
-
-                            value =
-                                searchText,
-
-                            onValueChange = {
-
-                                searchText =
-                                    it
-                            },
-
-                            modifier =
-                                Modifier.fillMaxWidth(),
-
-                            label = {
-                                Text("Hisse ara")
-                            },
-
-                            placeholder = {
-
-                                Text(
-                                    "THYAO, ASELS, GARAN..."
-                                )
-                            },
-
-                            singleLine = true
-                        )
-
-
-                        Spacer(
-                            modifier =
-                                Modifier.height(8.dp)
-                        )
-
-
-                        // =================================================
-                        // LİSTE
-                        // =================================================
-
-                        PullToRefreshBox(
-                            isRefreshing = isRefreshing,
-                            onRefresh = {
-                                lifecycleScope.launch {
-                                    refreshStocks()
-                                }
-                            },
-                            state = pullToRefreshState,
-                            modifier = Modifier.fillMaxSize()
-                        ) {
-
-                            LazyColumn(
-
-                                modifier =
-                                    Modifier.fillMaxSize()
-                            ) {
-
-                                items(
-                                    items = filteredStocks,
-                                    key = { it.sembol }
-                                ) { stock ->
-
-
-                                val analysis =
-                                    analyzeStock(
-                                        stock.degisimYuzde
-                                    )
-
-
-                                StockCard(
-
-                                    code =
-                                        stock.sembol,
-
-                                    fiyat =
-                                        stock.fiyat,
-
-                                    oncekiKapanis =
-                                        stock.oncekiKapanis,
-
-                                    change =
-                                        stock.degisimYuzde,
-
-                                    currency =
-                                        stock.paraBirimi,
-
-                                    signal =
-                                        analysis.signal,
-
-                                    confidence =
-                                        analysis.confidence,
-
-                                    risk =
-                                        analysis.risk
-                                )
-                            }
-                        }
-                    }
-                    }
-                }
-            }
-        }
-
-
-        // =========================================================
-        // İLK YÜKLEME + 30 SANİYELİK OTOMATİK YENİLEME
-        // =========================================================
-
-        startAutoRefresh()
-    }
-
-
-    // =========================================================
-    // OTOMATİK CANLI YENİLEME
-    // =========================================================
-
-    private fun startAutoRefresh() {
-
-        refreshJob?.cancel()
-
-        refreshJob =
-            lifecycleScope.launch {
-
-                while (isActive) {
-
-                    refreshStocks()
-
-                    // Bir sonraki yenileme için 30 saniye bekle.
-                    delay(30_000)
-                }
-            }
-    }
-
-
-    // =========================================================
-    // CANLI FİYATLARI SERVER'DAN AL
-    // =========================================================
-
-    private suspend fun refreshStocks() {
-
-        if (isRefreshing) {
-            return
-        }
-
-
-        isRefreshing = true
-
-        loadError = ""
-
-
-        try {
-
-            println(
-                "================================================="
             )
 
-            println(
-                "YALCIN PRO - ANDROID CANLI YENILEME"
+            if new_result:
+
+                _save_stock_memory(
+
+                    symbol,
+
+                    new_result
+
+                )
+
+                _save_persistent_cache()
+
+        except Exception as e:
+
+            print(
+                "YALCIN PRO - TEK HISSE GUNCELLEME HATASI:",
+                symbol,
+                e
             )
 
+    thread = threading.Thread(
 
-            // =====================================================
-            // SERVER'A BOŞ SYMBOL GÖNDERİYORUZ.
-            // SERVER KENDİ AKTİF 614 HİSSESİNİ DÖNDÜRÜYOR.
-            // =====================================================
+        target=update_one,
 
-            val response =
-                RetrofitClient
-                    .getBistStocksFromServer("")
+        daemon=True
 
+    )
 
-            if (!response.success) {
+    thread.start()
 
-                throw Exception(
-                    "Server success=false"
-                )
-            }
+    # ---------------------------------------------------------
+    # ESKİ VERİ VARSA HEMEN GÖNDER
+    # ---------------------------------------------------------
 
+    if result is not None:
 
-            // =====================================================
-            // TEMİZLE
-            // =====================================================
+        return jsonify({
 
-            val newStocks =
-                response.data
+            "success":
+                True,
 
-                    .filter {
-                        it.sembol.isNotBlank()
-                    }
+            "data": [
+                result
+            ]
 
-                    .map {
+        })
 
-                        it.copy(
-                            sembol =
-                                it.sembol
-                                    .trim()
-                                    .uppercase(
-                                        Locale.ROOT
-                                    )
-                        )
-                    }
+    # ---------------------------------------------------------
+    # VERİ YOKSA
+    # ---------------------------------------------------------
 
-                    .distinctBy {
-                        normalizeSymbol(
-                            it.sembol
-                        )
-                    }
+    return jsonify({
+
+        "success":
+            True,
+
+        "data":
+            []
+
+    })
 
 
-            if (newStocks.isEmpty()) {
+# =============================================================
+# TÜM HİSSELER
+# =============================================================
 
-                throw Exception(
-                    "Server fiyat verisi göndermedi."
-                )
-            }
+@app.route("/stocks")
+def stocks():
 
+    # SERVER OTORITESI:
+    # Android eski sürümde 19 sembol gönderse bile server
+    # kendi 614 hisselik aktif BIST evrenini kullanır.
+    symbols = get_bist_symbols()
 
-            // =====================================================
-            // EN ÖNEMLİ KISIM:
-            // LİSTEYİ TEK SEFERDE DEĞİŞTİR.
-            //
-            // Böylece Compose kesin olarak yeniden çizilir.
-            // =====================================================
+    if not symbols:
 
-            stocks =
-                newStocks.toList()
+        return jsonify({
 
+            "success":
+                False,
 
-            serverSymbolCount =
-                newStocks.size
+            "error":
+                "Hisse sembol listesi bulunamadı",
 
+            "data":
+                []
 
-            // =====================================================
-            // SON GÜNCELLEME ZAMANI
-            // =====================================================
+        }), 503
 
-            val formatter =
-                SimpleDateFormat(
-                    "HH:mm:ss",
-                    Locale.getDefault()
-                )
+    print(
+        "================================================="
+    )
 
+    print(
+        "YALCIN PRO - ANDROID ISTEGI:",
+        len(symbols),
+        "HISSE"
+    )
 
-            lastUpdateTime =
-                formatter.format(
-                    Date()
-                )
+    # ---------------------------------------------------------
+    # ARKA PLAN YENİLEME
+    # ---------------------------------------------------------
 
+    start_background_refresh(
+        symbols
+    )
 
-            // =====================================================
-            // KONTROL LOG'LARI
-            // =====================================================
+    # ---------------------------------------------------------
+    # CACHE
+    # ---------------------------------------------------------
 
-            val kontrolSembolleri =
-                listOf(
-                    "THYAO",
-                    "VERUS",
-                    "USHOL",
-                    "YUNSA",
-                    "AKBNK"
-                )
+    result_map = {}
 
+    fresh_count = 0
 
-            for (
-            symbol in kontrolSembolleri
-            ) {
+    stale_count = 0
 
-                val stock =
-                    newStocks.firstOrNull {
+    with _cache_lock:
 
-                        normalizeSymbol(
-                            it.sembol
-                        ) ==
-                                normalizeSymbol(
-                                    symbol
-                                )
-                    }
+        for symbol in symbols:
 
-
-                if (stock != null) {
-
-                    println(
-
-                        "YALCIN PRO - CANLI FIYAT: " +
-                                "${stock.sembol} = " +
-                                "${stock.fiyat} | DEG = " +
-                                "${stock.degisimYuzde}"
-                    )
-                }
-            }
-
-
-            println(
-                "YALCIN PRO - SERVER'DAN GELEN: " +
-                        "${newStocks.size} HISSE"
+            item = _stock_cache.get(
+                symbol
             )
 
-            println(
-                "YALCIN PRO - EKRANA AKTARILDI: " +
-                        "${stocks.size} HISSE"
+            if not item:
+
+                continue
+
+            timestamp, result = item
+
+            age = (
+                time.time()
+                - timestamp
             )
 
-            println(
-                "YALCIN PRO - GUNCELLEME: " +
-                        lastUpdateTime
+            result_map[
+                symbol
+            ] = result
+
+            if (
+                age
+                <
+                CACHE_TTL_SECONDS
+            ):
+
+                fresh_count += 1
+
+            else:
+
+                stale_count += 1
+
+    # ---------------------------------------------------------
+    # ANDROID SIRASINI KORU + EKSIKLERI DE GONDER
+    # ---------------------------------------------------------
+    # Bazı hisselerin Yahoo verisi o anda yoksa listeyi 438'e
+    # düşürmüyoruz. Sembol kaydı 0.0 değerleriyle korunuyor.
+    # Arka plan yenilemesi sonraki turlarda gerçek fiyatı doldurur.
+    ordered_results = []
+
+    for symbol in symbols:
+        result = result_map.get(symbol)
+
+        if result is not None:
+            ordered_results.append(result)
+        else:
+            ordered_results.append({
+                "sembol": symbol,
+                "fiyat": 0.0,
+                "oncekiKapanis": 0.0,
+                "degisimYuzde": 0.0,
+                "paraBirimi": "TRY"
+            })
+
+    # ---------------------------------------------------------
+    # EKSİKLER
+    # ---------------------------------------------------------
+
+    missing = [
+
+        symbol
+
+        for symbol in symbols
+
+        if symbol not in result_map
+
+    ]
+
+    print(
+        "YALCIN PRO - CACHE:",
+        len(result_map),
+        "/",
+        len(symbols),
+        "| TAZE:",
+        fresh_count,
+        "| ESKI:",
+        stale_count,
+        "| EKSIK:",
+        len(missing)
+    )
+
+    if missing:
+
+        print(
+            "YALCIN PRO - VERISI OLMAYAN:",
+            ", ".join(
+                missing[:50]
             )
-
-            println(
-                "================================================="
-            )
-
-
-        } catch (e: Exception) {
-
-            loadError =
-                e.message
-                    ?: "Bilinmeyen hata"
-
-
-            println(
-                "YALCIN PRO - CANLI YENILEME HATASI: $e"
-            )
-
-        } finally {
-
-            isRefreshing =
-                false
-        }
-    }
-
-
-    override fun onDestroy() {
-
-        refreshJob?.cancel()
-
-        super.onDestroy()
-    }
-}
-
-
-// =============================================================
-// HİSSE KARTI
-// =============================================================
-
-@Composable
-fun StockCard(
-
-    code: String,
-
-    fiyat: Double?,
-
-    oncekiKapanis: Double?,
-
-    change: Double?,
-
-    currency: String,
-
-    signal: String,
-
-    confidence: Int,
-
-    risk: String
-) {
-
-    val context =
-        LocalContext.current
-
-
-    // =========================================================
-    // DEĞİŞİM RENGİ
-    // =========================================================
-
-    val changeColor =
-        when {
-
-            change == null -> {
-
-                MaterialTheme
-                    .colorScheme
-                    .onSurfaceVariant
-            }
-
-            change > 0 -> {
-
-                Color(
-                    0xFF16803C
-                )
-            }
-
-            change < 0 -> {
-
-                Color(
-                    0xFFD32F2F
-                )
-            }
-
-            else -> {
-
-                MaterialTheme
-                    .colorScheme
-                    .onSurfaceVariant
-            }
-        }
-
-
-    // =========================================================
-    // DEĞİŞİM ARKA PLANI
-    // =========================================================
-
-    val changeBackground =
-        when {
-
-            change == null -> {
-
-                MaterialTheme
-                    .colorScheme
-                    .surfaceVariant
-            }
-
-            change > 0 -> {
-
-                Color(
-                    0xFFE8F5E9
-                )
-            }
-
-            change < 0 -> {
-
-                Color(
-                    0xFFFFEBEE
-                )
-            }
-
-            else -> {
-
-                MaterialTheme
-                    .colorScheme
-                    .surfaceVariant
-            }
-        }
-
-
-    // =========================================================
-    // FİYAT
-    // =========================================================
-
-    val priceText =
-        if (
-            fiyat != null &&
-            fiyat > 0.0
-        ) {
-
-            String.format(
-
-                Locale.US,
-
-                "%.2f %s",
-
-                fiyat,
-
-                currency
-            )
-
-        } else {
-
-            "Veri bekleniyor"
-        }
-
-
-    // =========================================================
-    // DEĞİŞİM
-    // =========================================================
-
-    val changeText =
-        if (
-            change != null
-        ) {
-
-            String.format(
-
-                Locale.US,
-
-                "%+.2f%%",
-
-                change
-            )
-
-        } else {
-
-            "--"
-        }
-
-
-    // =========================================================
-    // KART
-    // =========================================================
-
-    Card(
-
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .padding(
-                    vertical = 6.dp
-                )
-                .clickable {
-
-                    val intent =
-                        Intent(
-                            context,
-                            StockDetailActivity::class.java
-                        )
-
-
-                    intent.putExtra(
-                        "stockName",
-                        code
-                    )
-
-
-                    intent.putExtra(
-                        "fiyat",
-                        fiyat
-                            ?: Double.NaN
-                    )
-
-
-                    intent.putExtra(
-                        "oncekiKapanis",
-                        oncekiKapanis
-                            ?: Double.NaN
-                    )
-
-
-                    intent.putExtra(
-                        "degisimYuzde",
-                        change
-                            ?: Double.NaN
-                    )
-
-
-                    intent.putExtra(
-                        "paraBirimi",
-                        currency
-                    )
-
-
-                    intent.putExtra(
-                        "signal",
-                        signal
-                    )
-
-
-                    intent.putExtra(
-                        "confidence",
-                        confidence
-                    )
-
-
-                    intent.putExtra(
-                        "risk",
-                        risk
-                    )
-
-
-                    context.startActivity(
-                        intent
-                    )
-                },
-
-        shape =
-            RoundedCornerShape(
-                18.dp
-            ),
-
-        elevation =
-            CardDefaults
-                .cardElevation(
-                    defaultElevation = 3.dp
-                )
-
-    ) {
-
-        Column(
-
-            modifier =
-                Modifier.padding(
-                    16.dp
-                )
-        ) {
-
-            Row(
-
-                modifier =
-                    Modifier.fillMaxWidth(),
-
-                verticalAlignment =
-                    Alignment.CenterVertically,
-
-                horizontalArrangement =
-                    Arrangement.SpaceBetween
-            ) {
-
-                Column(
-
-                    modifier =
-                        Modifier.weight(1f)
-                ) {
-
-                    Text(
-
-                        text =
-                            code,
-
-                        fontWeight =
-                            FontWeight.Bold,
-
-                        fontSize =
-                            22.sp
-                    )
-
-
-                    Spacer(
-                        modifier =
-                            Modifier.height(3.dp)
-                    )
-
-
-                    Text(
-
-                        text =
-                            "BIST",
-
-                        fontSize =
-                            12.sp,
-
-                        color =
-                            MaterialTheme
-                                .colorScheme
-                                .onSurfaceVariant
-                    )
-                }
-
-
-                Column(
-
-                    horizontalAlignment =
-                        Alignment.End
-                ) {
-
-                    Text(
-
-                        text =
-                            priceText,
-
-                        fontSize =
-                            18.sp,
-
-                        fontWeight =
-                            FontWeight.Bold
-                    )
-
-
-                    Spacer(
-                        modifier =
-                            Modifier.height(4.dp)
-                    )
-
-
-                    Text(
-
-                        text =
-                            changeText,
-
-                        modifier =
-                            Modifier
-                                .background(
-
-                                    color =
-                                        changeBackground,
-
-                                    shape =
-                                        RoundedCornerShape(
-                                            8.dp
-                                        )
-                                )
-                                .padding(
-
-                                    horizontal =
-                                        8.dp,
-
-                                    vertical =
-                                        4.dp
-                                ),
-
-                        color =
-                            changeColor,
-
-                        fontWeight =
-                            FontWeight.Bold,
-
-                        fontSize =
-                            14.sp
-                    )
-                }
-            }
-
-
-            Spacer(
-                modifier =
-                    Modifier.height(14.dp)
-            )
-
-
-            Row(
-
-                modifier =
-                    Modifier.fillMaxWidth(),
-
-                horizontalArrangement =
-                    Arrangement.spacedBy(
-                        8.dp
-                    )
-            ) {
-
-                InfoBox(
-
-                    title =
-                        "SİNYAL",
-
-                    value =
-                        signal,
-
-                    modifier =
-                        Modifier.weight(1f)
-                )
-
-
-                InfoBox(
-
-                    title =
-                        "GÜVEN",
-
-                    value =
-                        "$confidence /100",
-
-                    modifier =
-                        Modifier.weight(1f)
-                )
-
-
-                InfoBox(
-
-                    title =
-                        "RİSK",
-
-                    value =
-                        risk,
-
-                    modifier =
-                        Modifier.weight(1f)
-                )
-            }
-        }
-    }
-}
-
-
-// =============================================================
-// BİLGİ KUTUSU
-// =============================================================
-
-@Composable
-fun InfoBox(
-
-    title: String,
-
-    value: String,
-
-    modifier: Modifier =
-        Modifier
-) {
-
-    Column(
-
-        modifier =
-            modifier
-                .background(
-
-                    color =
-                        MaterialTheme
-                            .colorScheme
-                            .surfaceVariant,
-
-                    shape =
-                        RoundedCornerShape(
-                            10.dp
-                        )
-                )
-                .padding(
-                    8.dp
-                )
-    ) {
-
-        Text(
-
-            text =
-                title,
-
-            fontSize =
-                10.sp,
-
-            fontWeight =
-                FontWeight.Bold,
-
-            color =
-                MaterialTheme
-                    .colorScheme
-                    .onSurfaceVariant
         )
 
+    print(
+        "YALCIN PRO - CEVAP:",
+        len(ordered_results),
+        "/",
+        len(symbols)
+    )
 
-        Spacer(
-            modifier =
-                Modifier.height(2.dp)
+    for debug_symbol in (
+        "THYAO",
+        "VERUS",
+        "USHOL",
+        "YUNSA",
+        "AKBNK"
+    ):
+        debug_item = result_map.get(debug_symbol)
+
+        if debug_item:
+            print(
+                "YALCIN PRO - /stocks FIYAT:",
+                debug_symbol,
+                "=",
+                debug_item.get("fiyat"),
+                "| DEG:",
+                debug_item.get("degisimYuzde")
+            )
+
+    print(
+        "================================================="
+    )
+
+    return jsonify({
+
+        "success":
+            True,
+
+        "data":
+            ordered_results
+
+    })
+
+
+# =============================================================
+# SERVER
+# =============================================================
+
+def start_server_bootstrap():
+    """
+    Server portu açıldıktan sonra KAP -> Yahoo sembol keşfini
+    arka planda yapar. Keşif tamamlanınca canlı fiyat yenilemesi
+    başlatılır. Böylece Flask 5000 portunu bekletmez.
+    """
+
+    def bootstrap_worker():
+        global _last_symbol_refresh
+
+        try:
+            print(
+                "YALCIN PRO - ARKA PLAN SEMBOL KESFI BASLADI"
+            )
+
+            with _symbol_list_lock:
+                current = list(_symbol_list)
+
+            if len(current) >= TARGET_BIST_STOCK_COUNT:
+                print(
+                    "YALCIN PRO - HAZIR AKTIF EVREN:",
+                    len(current),
+                    "HISSE"
+                )
+
+                _last_symbol_refresh = time.time()
+                start_background_refresh(current)
+                return
+
+            discovered = _refresh_symbol_universe(force=True)
+
+            if discovered:
+                print(
+                    "YALCIN PRO - ARKA PLAN SEMBOL KESFI TAMAM:",
+                    len(discovered),
+                    "HISSE"
+                )
+                start_background_refresh(discovered)
+            else:
+                print(
+                    "YALCIN PRO - SEMBOL KESFI SONUC VERMEDI"
+                )
+
+        except Exception as e:
+            print(
+                "YALCIN PRO - BASLANGIC SEMBOL KESFI HATASI:",
+                e
+            )
+
+    thread = threading.Thread(
+        target=bootstrap_worker,
+        daemon=True,
+        name="yalcin-symbol-bootstrap"
+    )
+    thread.start()
+
+
+# =============================================================
+# SERVER
+# =============================================================
+
+if __name__ == "__main__":
+
+    with _cache_lock:
+        cache_count = len(_stock_cache)
+
+    with _symbol_list_lock:
+        symbol_count = len(_symbol_list)
+
+    print(
+        "================================================="
+    )
+
+    print(
+        "YALCIN PRO SERVER"
+    )
+
+    print(
+        "CACHE:",
+        cache_count,
+        "HISSE"
+    )
+
+    print(
+        "SEMBOL:",
+        symbol_count,
+        "HISSE"
+    )
+
+    print(
+        "PORT: 5000"
+    )
+
+    print(
+        "CANLI YENILEME:",
+        BACKGROUND_REFRESH_SECONDS,
+        "SANIYE"
+    )
+
+    print(
+        "SEMBOL YENILEME:",
+        SYMBOL_REFRESH_SECONDS,
+        "SANIYE"
+    )
+
+    print(
+        "CACHE TTL:",
+        CACHE_TTL_SECONDS,
+        "SANIYE"
+    )
+
+    print(
+        "BATCH:",
+        BATCH_SIZE,
+        "HISSE"
+    )
+
+    print(
+        "================================================="
+    )
+
+    # Flask önce 5000 portunu açacak.
+    # KAP/Yahoo sembol keşfi ayrı thread'de çalışacak.
+    start_server_bootstrap()
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
         )
+    )
 
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        threaded=True
+    )
 
-        Text(
-
-            text =
-                value,
-
-            fontSize =
-                12.sp,
-
-            fontWeight =
-                FontWeight.Bold
-        )
-    }
-}
-```
