@@ -1418,76 +1418,120 @@ def _parse_tr_number(value):
         return None
 
 
+
 class IsYatirimTableParser(HTMLParser):
-    """İş Yatırım'ın Hisse/Son Fiyat/Değişim tablosunu bulur."""
+    """
+    İş Yatırım sayfasındaki hisse tablosunu nested table yapısından
+    bağımsız olarak okur.
+
+    Eski parser sadece table_depth == 1 kabul ettiği için sayfanın
+    güncel HTML yapısında tablo satırlarını buluyor gibi görünse de
+    sembol eşleştirmesi 0/25 kalabiliyordu.
+    """
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.table_depth = 0
         self.in_tr = False
-        self.in_cell = False
+        self.cell_depth = 0
         self.current_row = []
         self.current_cell = []
-        self.tables = []
-        self.current_table = []
+        self.rows = []
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
+
         if tag == "table":
             self.table_depth += 1
-            if self.table_depth == 1:
-                self.current_table = []
-        elif tag == "tr" and self.table_depth == 1:
+            return
+
+        if tag == "tr":
+            if self.in_tr:
+                self._finish_row()
             self.in_tr = True
             self.current_row = []
-        elif tag in ("td", "th") and self.table_depth == 1 and self.in_tr:
-            self.in_cell = True
             self.current_cell = []
+            self.cell_depth = 0
+            return
+
+        if self.in_tr and tag in ("td", "th"):
+            self.cell_depth += 1
+            if self.cell_depth == 1:
+                self.current_cell = []
 
     def handle_data(self, data):
-        if self.table_depth == 1 and self.in_cell:
+        if self.in_tr and self.cell_depth > 0:
             self.current_cell.append(data)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
-        if tag in ("td", "th") and self.table_depth == 1 and self.in_cell:
-            value = " ".join(self.current_cell).strip()
-            self.current_row.append(value)
-            self.current_cell = []
-            self.in_cell = False
-        elif tag == "tr" and self.table_depth == 1 and self.in_tr:
-            if self.current_row:
-                self.current_table.append(self.current_row)
-            self.current_row = []
-            self.in_tr = False
-        elif tag == "table":
-            if self.table_depth == 1 and self.current_table:
-                self.tables.append(self.current_table)
-            self.current_table = []
-            self.table_depth = max(0, self.table_depth - 1)
+
+        if tag in ("td", "th") and self.in_tr and self.cell_depth > 0:
+            self.cell_depth -= 1
+            if self.cell_depth == 0:
+                value = " ".join(self.current_cell).strip()
+                self.current_row.append(value)
+                self.current_cell = []
+            return
+
+        if tag == "tr" and self.in_tr:
+            self._finish_row()
+            return
+
+        if tag == "table" and self.table_depth > 0:
+            self.table_depth -= 1
+
+    def _finish_row(self):
+        row = [
+            re.sub(r"\s+", " ", str(x)).strip()
+            for x in self.current_row
+        ]
+        row = [x for x in row if x != ""]
+        if row:
+            self.rows.append(row)
+
+        self.in_tr = False
+        self.current_row = []
+        self.current_cell = []
+        self.cell_depth = 0
 
 
 def _clean_symbol_from_table(value):
     if not value:
         return ""
+
     text = str(value).upper()
     text = (
-        text.replace("\\xa0", " ")
-            .replace("\\u200b", "")
-            .replace("\\ufeff", "")
+        text.replace("\xa0", " ")
+            .replace("\u200b", "")
+            .replace("\ufeff", "")
             .strip()
     )
-    match = re.search(r"[A-Z0-9]{2,8}", text)
+
+    # İlk hücre bazen "ADEL - ADEL KALEMCİLİK..." biçiminde gelebilir.
+    # Sembolü sadece ilk geçerli BIST kodundan çıkar.
+    match = re.search(r"\b[A-Z0-9]{2,8}\b", text)
     if not match:
         return ""
+
     return normalize_symbol(match.group(0))
 
 
 def _download_isyatirim_snapshot():
-    """İş Yatırım tablosundan fiyat + günlük değişim değerlerini tek seferde alır."""
+    """
+    İş Yatırım'ın yayınladığı Son Fiyat + Değişim (%) değerlerini
+    doğrudan alır.
+
+    ÖNEMLİ:
+    - Günlük değişim burada yeniden hesaplanmaz.
+    - Yahoo kullanılmaz.
+    - Önceki yenilemeye göre yüzde hesaplanmaz.
+    - Kaynağın verdiği DEĞİŞİM (%) doğrudan degisimYuzde olur.
+    """
     global _isyatirim_snapshot, _isyatirim_snapshot_time
 
     now = time.time()
+
     with _isyatirim_snapshot_lock:
         if (
             _isyatirim_snapshot
@@ -1497,6 +1541,7 @@ def _download_isyatirim_snapshot():
 
         try:
             print("YALCIN PRO - IS YATIRIM SNAPSHOT ALINIYOR...")
+
             req = urllib.request.Request(
                 ISYATIRIM_URL,
                 headers={
@@ -1505,97 +1550,216 @@ def _download_isyatirim_snapshot():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/120.0 Safari/537.36"
                     ),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept": (
+                        "text/html,application/xhtml+xml,"
+                        "application/xml;q=0.9,*/*;q=0.8"
+                    ),
+                    "Accept-Language":
+                        "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
                     "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
                 },
             )
 
             with urllib.request.urlopen(req, timeout=20) as response:
-                html = response.read().decode("utf-8", errors="ignore")
+                html = response.read().decode(
+                    "utf-8",
+                    errors="ignore"
+                )
 
             parser = IsYatirimTableParser()
             parser.feed(html)
 
-            snapshot = {}
-            selected_rows = 0
+            rows = parser.rows
 
-            for table in parser.tables:
-                header_index = None
-                price_index = None
-                change_index = None
+            print(
+                "YALCIN PRO - IS YATIRIM HTML SATIR:",
+                len(rows)
+            )
 
-                for row_index, row in enumerate(table[:20]):
-                    normalized = [
-                        re.sub(r"\\s+", " ", str(cell)).strip().lower()
-                        for cell in row
-                    ]
-                    for idx, cell in enumerate(normalized):
-                        if "hisse" == cell or cell.startswith("hisse"):
-                            header_index = row_index
-                            break
-                    if header_index is not None:
-                        for idx, cell in enumerate(normalized):
-                            if "son fiyat" in cell:
-                                price_index = idx
-                            if "değişim (%)" in cell or "degisim (%)" in cell:
-                                change_index = idx
-                        if price_index is not None and change_index is not None:
-                            break
+            # -----------------------------------------------------
+            # TABLO BAŞLIĞINI BUL
+            # -----------------------------------------------------
+            header_index = None
+            price_index = None
+            change_index = None
 
-                if header_index is None or price_index is None or change_index is None:
+            for row_index, row in enumerate(rows[:500]):
+                normalized = [
+                    re.sub(r"\s+", " ", str(cell))
+                    .strip()
+                    .lower()
+                    for cell in row
+                ]
+
+                for idx, cell in enumerate(normalized):
+                    if (
+                        cell == "hisse"
+                        or cell.startswith("hisse ")
+                    ):
+                        header_index = row_index
+                        break
+
+                if header_index is None:
                     continue
 
-                for row in table[header_index + 1:]:
-                    if max(price_index, change_index) >= len(row):
-                        continue
-                    symbol = _clean_symbol_from_table(row[0] if row else "")
-                    if not symbol:
-                        continue
+                for idx, cell in enumerate(normalized):
+                    if "son fiyat" in cell:
+                        price_index = idx
 
-                    price = _parse_tr_number(row[price_index])
-                    change = _parse_tr_number(row[change_index])
+                    if (
+                        "değişim (%)" in cell
+                        or "degisim (%)" in cell
+                    ):
+                        change_index = idx
 
-                    if price is None or price <= 0 or change is None:
-                        continue
+                if (
+                    price_index is not None
+                    and change_index is not None
+                ):
+                    break
 
-                    # Kaynağın verdiği değişim DOĞRUDAN kullanılır.
-                    previous_close = price
-                    denominator = 1.0 + (change / 100.0)
-                    if abs(denominator) > 1e-12:
-                        previous_close = price / denominator
+            print(
+                "YALCIN PRO - IS YATIRIM HEADER:",
+                header_index,
+                "| FIYAT:",
+                price_index,
+                "| DEG:",
+                change_index
+            )
 
-                    snapshot[symbol] = {
-                        "sembol": symbol,
-                        "fiyat": round(price, 2),
-                        "oncekiKapanis": round(previous_close, 2),
-                        "degisimYuzde": round(change, 2),
-                        "paraBirimi": "TRY",
-                    }
-                    selected_rows += 1
-
-            if len(snapshot) < 500:
+            if (
+                header_index is None
+                or price_index is None
+                or change_index is None
+            ):
                 print(
-                    "YALCIN PRO - IS YATIRIM SNAPSHOT YETERSIZ:",
-                    len(snapshot),
-                    "HISSE"
+                    "YALCIN PRO - IS YATIRIM TABLO BASLIGI BULUNAMADI"
                 )
-                # Eski snapshot varsa yanlışlıkla boş veriyle ezme.
-                return dict(_isyatirim_snapshot)
 
-            _isyatirim_snapshot = snapshot
-            _isyatirim_snapshot_time = time.time()
+                # Yanlış/eski veri kullanma.
+                return {}
+
+            snapshot = {}
+
+            # -----------------------------------------------------
+            # SATIRLARI OKU
+            # -----------------------------------------------------
+            for row in rows[header_index + 1:]:
+                if not row:
+                    continue
+
+                required_index = max(
+                    price_index,
+                    change_index
+                )
+
+                if required_index >= len(row):
+                    continue
+
+                symbol = _clean_symbol_from_table(
+                    row[0]
+                )
+
+                if not symbol:
+                    continue
+
+                price = _parse_tr_number(
+                    row[price_index]
+                )
+
+                change = _parse_tr_number(
+                    row[change_index]
+                )
+
+                if (
+                    price is None
+                    or price <= 0
+                    or change is None
+                ):
+                    continue
+
+                # Kaynağın verdiği günlük değişim.
+                # Burada hiçbir yüzde hesabı yapılmıyor.
+                previous_close = price
+
+                denominator = (
+                    1.0 + change / 100.0
+                )
+
+                if abs(denominator) > 1e-12:
+                    previous_close = (
+                        price / denominator
+                    )
+
+                snapshot[symbol] = {
+                    "sembol": symbol,
+                    "fiyat": round(price, 2),
+                    "oncekiKapanis": round(
+                        previous_close,
+                        2
+                    ),
+                    "degisimYuzde": round(
+                        change,
+                        2
+                    ),
+                    "paraBirimi": "TRY",
+                }
 
             print(
                 "YALCIN PRO - IS YATIRIM SNAPSHOT:",
                 len(snapshot),
                 "HISSE"
             )
+
+            # -----------------------------------------------------
+            # KRİTİK KONTROL
+            # -----------------------------------------------------
+            for debug_symbol in (
+                "ADEL",
+                "THYAO",
+                "AKBNK",
+                "GARAN",
+                "YUNSA",
+                "VERUS",
+                "USHOL",
+            ):
+                item = snapshot.get(
+                    debug_symbol
+                )
+
+                if item:
+                    print(
+                        "YALCIN PRO - KAYNAK:",
+                        debug_symbol,
+                        "| FIYAT=",
+                        item["fiyat"],
+                        "| GUNLUK_DEG=%",
+                        item["degisimYuzde"]
+                    )
+
+            # 500'den az veri geldiyse snapshot'ı başarılı
+            # kabul etmiyoruz. Böylece eski yanlış cache'in
+            # üzerine bozuk veri yazılmaz.
+            if len(snapshot) < 500:
+                print(
+                    "YALCIN PRO - IS YATIRIM SNAPSHOT YETERSIZ:",
+                    len(snapshot),
+                    "HISSE"
+                )
+                return {}
+
+            _isyatirim_snapshot = snapshot
+            _isyatirim_snapshot_time = time.time()
+
             return dict(snapshot)
 
         except Exception as e:
-            print("YALCIN PRO - IS YATIRIM SNAPSHOT HATASI:", e)
-            return dict(_isyatirim_snapshot)
+            print(
+                "YALCIN PRO - IS YATIRIM SNAPSHOT HATASI:",
+                e
+            )
+            return {}
 
 
 def get_stocks_batch(symbols):
