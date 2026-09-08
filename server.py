@@ -1762,6 +1762,76 @@ def _download_isyatirim_snapshot():
             return {}
 
 
+def _sync_active_symbols_from_snapshot(snapshot):
+    """
+    İş Yatırım snapshot'ında gerçekten bulunan sembollerden 614'lük
+    aktif evreni oluşturur. Böylece KAP/Yahoo cache'inde kalmış ancak
+    kaynak tabloda bulunmayan semboller 614'lük canlı turu bloke etmez.
+
+    Mevcut sırayı mümkün olduğunca korur; eksilen sembollerin yerine
+    snapshot'ta bulunan yeni semboller eklenir.
+    """
+    global _symbol_list
+
+    if not snapshot:
+        return []
+
+    source_symbols = list(dict.fromkeys(
+        normalize_symbol(s)
+        for s in snapshot.keys()
+        if normalize_symbol(s)
+    ))
+
+    if len(source_symbols) < TARGET_BIST_STOCK_COUNT:
+        print(
+            "YALCIN PRO - KAYNAKTA 614'TEN AZ HISSE VAR:",
+            len(source_symbols),
+            "/", TARGET_BIST_STOCK_COUNT
+        )
+        return []
+
+    source_set = set(source_symbols)
+
+    with _symbol_list_lock:
+        current = list(_symbol_list)
+
+    # Önce mevcut 614 evrenden kaynakta bulunanları koru.
+    ordered = [s for s in current if s in source_set]
+
+    # Eksilenlerin yerini kaynakta bulunan yeni sembollerle doldur.
+    for symbol in source_symbols:
+        if symbol not in ordered:
+            ordered.append(symbol)
+        if len(ordered) >= TARGET_BIST_STOCK_COUNT:
+            break
+
+    ordered = ordered[:TARGET_BIST_STOCK_COUNT]
+
+    with _symbol_list_lock:
+        _symbol_list = ordered
+
+    missing_from_source = [s for s in current if s not in source_set]
+    added_from_source = [s for s in ordered if s not in current]
+
+    print(
+        "YALCIN PRO - CANLI EVREN SENKRONIZE:",
+        len(ordered),
+        "/", TARGET_BIST_STOCK_COUNT,
+        "| KAYNAK:", len(source_symbols),
+        "| CIKAN:", len(missing_from_source),
+        "| EKLENEN:", len(added_from_source)
+    )
+
+    if missing_from_source:
+        print(
+            "YALCIN PRO - KAYNAKTA OLMAYAN ESKI SEMBOLLER:",
+            ", ".join(missing_from_source[:50])
+        )
+
+    _save_active_symbol_cache(ordered)
+    return ordered
+
+
 def get_stocks_batch(symbols):
     """614'lük evrenden gelen grup için İş Yatırım değerlerini döndürür."""
     symbols = list(dict.fromkeys(
@@ -1856,6 +1926,20 @@ def start_background_refresh(
 
                 if latest_symbols:
                     refresh_symbols = list(latest_symbols)
+
+                # -------------------------------------------------
+                # CANLI KAYNAKTA GERCEKTEN BULUNAN SEMBOLLERDEN
+                # 614'LUK EVRENİ OLUŞTUR.
+                # -------------------------------------------------
+                live_snapshot = _download_isyatirim_snapshot()
+                synced_symbols = _sync_active_symbols_from_snapshot(live_snapshot)
+
+                if synced_symbols:
+                    refresh_symbols = list(synced_symbols)
+                else:
+                    print(
+                        "YALCIN PRO - CANLI EVREN SENKRONIZASYONU BASARISIZ; MEVCUT EVREN KORUNUYOR"
+                    )
 
                 # -------------------------------------------------
                 # GRUPLARI OLUŞTUR
