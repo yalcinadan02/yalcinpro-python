@@ -13,6 +13,8 @@ import urllib.request
 # =========================================================
 # Gerçek API anahtarını sadece bu satıra yaz.
 APINOKTAM_API_KEY = "ak_live_bb8bd2d307ac905f51429e08a8539ac65f440c13b674830f"
+APINOKTAM_BASE_URL = "https://api.apinoktam.erenozdemir.com.tr/v1/bist"
+APINOKTAM_LIMIT = 200
 
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
@@ -1193,6 +1195,156 @@ def _extract_close(
 # SONUÇ OLUŞTUR
 # =============================================================
 
+def _to_float(value):
+    """API'den gelen sayısal alanları güvenli şekilde float'a çevirir."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace("%", "").replace(",", ".")
+            if value == "":
+                return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _pick_value(item, *keys):
+    for key in keys:
+        if isinstance(item, dict) and key in item:
+            value = item.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _normalize_apinoktam_item(item):
+    """Apinoktam BIST cevabını Yalçın Pro formatına dönüştürür.
+
+    En önemli nokta: degisimYuzde API'den geliyorsa yeniden hesaplanmaz.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    symbol = _pick_value(
+        item,
+        "sembol", "symbol", "code", "ticker", "hisse", "kod"
+    )
+    symbol = normalize_symbol(symbol)
+    if not symbol:
+        return None
+
+    price = _to_float(_pick_value(
+        item,
+        "fiyat", "price", "last", "currentPrice",
+        "regularMarketPrice", "close", "c"
+    ))
+
+    previous = _to_float(_pick_value(
+        item,
+        "oncekiKapanis", "previousClose", "previous_close",
+        "prevClose", "previous", "pc"
+    ))
+
+    # BIST'in/API'nin verdiği GÜNLÜK değişim yüzdesini doğrudan al.
+    change = _to_float(_pick_value(
+        item,
+        "degisimYuzde", "changePercent", "change_percent",
+        "percentChange", "changePct", "dp"
+    ))
+
+    if price is None or price <= 0:
+        return None
+
+    if previous is None or previous <= 0:
+        previous = price
+
+    # change API'de yoksa yalnızca güvenli bir fallback kullan.
+    # Normal durumda API'nin günlük yüzdesi doğrudan korunur.
+    if change is None:
+        change = ((price - previous) / previous) * 100.0
+
+    return {
+        "sembol": symbol,
+        "fiyat": round(price, 2),
+        "oncekiKapanis": round(previous, 2),
+        "degisimYuzde": round(change, 2),
+        "paraBirimi": "TRY"
+    }
+
+
+def get_stocks_from_apinoktam():
+    """Apinoktam'dan 614 hisseyi 200'lük sayfalarda alır.
+
+    API'nin gönderdiği günlük değişim yüzdesi aynen korunur.
+    Android tarafında tekrar hesaplama yapılmaz.
+    """
+    all_items = []
+
+    for offset in range(0, TARGET_BIST_STOCK_COUNT, APINOKTAM_LIMIT):
+        url = (
+            f"{APINOKTAM_BASE_URL}"
+            f"?limit={APINOKTAM_LIMIT}&offset={offset}"
+        )
+
+        request_obj = urllib.request.Request(
+            url,
+            headers={
+                "x-api-key": APINOKTAM_API_KEY,
+                "Authorization": f"Bearer {APINOKTAM_API_KEY}",
+                "Accept": "application/json",
+                "User-Agent": "YalcinPro/1.0"
+            },
+            method="GET"
+        )
+
+        with urllib.request.urlopen(
+            request_obj,
+            timeout=20
+        ) as response:
+            raw = response.read().decode("utf-8", errors="ignore")
+
+        payload = json.loads(raw)
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+
+        # Bazı API cevaplarında data doğrudan liste, bazılarında data.items
+        # olabilir; ikisini de destekle.
+        if isinstance(data, dict):
+            data = data.get("items", data.get("results", []))
+
+        if not isinstance(data, list):
+            data = []
+
+        all_items.extend(data)
+
+        print(
+            "YALCIN PRO - APINOKTAM SAYFA:",
+            offset,
+            "-",
+            offset + len(data),
+            "| GELEN:",
+            len(data)
+        )
+
+        if len(data) < APINOKTAM_LIMIT:
+            break
+
+    result_map = {}
+
+    for item in all_items:
+        result = _normalize_apinoktam_item(item)
+        if result:
+            result_map[result["sembol"]] = result
+
+    print(
+        "YALCIN PRO - APINOKTAM TOPLAM:",
+        len(result_map),
+        "HISSE"
+    )
+
+    return result_map
+
+
 def _make_result(
     symbol,
     closes,
@@ -1786,136 +1938,173 @@ def start_background_refresh(
                     refresh_symbols = list(latest_symbols)
 
                 # -------------------------------------------------
-                # GRUPLARI OLUŞTUR
+                # ÖNCELİKLİ KAYNAK: APINOKTAM BIST
+                # -------------------------------------------------
+                # API'nin verdiği günlük degisimYuzde doğrudan kullanılır.
+                # Önceki yenilemeye göre yüzde hesabı yapılmaz.
                 # -------------------------------------------------
 
-                batches = [
+                api_map = {}
 
-                    refresh_symbols[
-                        i:i + BATCH_SIZE
-                    ]
-
-                    for i in range(
-                        0,
-                        len(refresh_symbols),
-                        BATCH_SIZE
+                try:
+                    api_map = get_stocks_from_apinoktam()
+                except Exception as api_error:
+                    print(
+                        "YALCIN PRO - APINOKTAM HATASI, YAHOO FALLBACK:",
+                        api_error
                     )
 
-                ]
-
                 total_updated = 0
-
                 total_missing = 0
 
-                print(
-                    "YALCIN PRO - YENILEME TURU:",
-                    len(batches),
-                    "GRUP"
-                )
+                if api_map:
 
-                # -------------------------------------------------
-                # -------------------------------------------------
-                # TÜM GRUPLARI KONTROLLÜ PARALEL YENİLE
-                # -------------------------------------------------
-                # 25 grup artık 4 işçiyle aynı anda çalışır.
-                # Böylece listenin sonundaki VERUS gibi hisseler
-                # ilk grubun bitmesini beklemez.
-                # -------------------------------------------------
+                    for symbol in refresh_symbols:
 
-                def refresh_one_batch(index, batch):
+                        result = api_map.get(symbol)
+
+                        if result:
+                            _save_stock_memory(
+                                symbol,
+                                result
+                            )
+                            total_updated += 1
+                        else:
+                            total_missing += 1
+
                     print(
-                        "YALCIN PRO - GRUP:",
-                        index,
+                        "YALCIN PRO - APINOKTAM GUNCELLEME:",
+                        total_updated,
                         "/",
-                        len(batches),
-                        "|",
-                        len(batch),
+                        len(refresh_symbols),
                         "HISSE"
                     )
 
-                    for retry in range(RETRY_COUNT + 1):
-                        try:
-                            results, missing = get_stocks_batch(batch)
+                # -------------------------------------------------
+                # APINOKTAM VERİ VERMEZSE YAHOO FALLBACK
+                # -------------------------------------------------
 
-                            for result in results:
-                                symbol = normalize_symbol(
-                                    result.get("sembol", "")
-                                )
+                if not api_map:
 
-                                if symbol:
-                                    _save_stock_memory(
-                                        symbol,
-                                        result
-                                    )
-
-                            print(
-                                "YALCIN PRO - GRUP TAMAM:",
-                                index,
-                                "| GUNCEL:",
-                                len(results),
-                                "| EKSIK:",
-                                len(missing),
-                                "| DENEME:",
-                                retry + 1
-                            )
-
-                            return len(results), len(missing)
-
-                        except Exception as e:
-                            print(
-                                "YALCIN PRO - GRUP HATASI:",
-                                index,
-                                "| DENEME:",
-                                retry + 1,
-                                e
-                            )
-
-                            if retry < RETRY_COUNT:
-                                time.sleep(RETRY_WAIT_SECONDS)
+                    batches = [
+                        refresh_symbols[
+                            i:i + BATCH_SIZE
+                        ]
+                        for i in range(
+                            0,
+                            len(refresh_symbols),
+                            BATCH_SIZE
+                        )
+                    ]
 
                     print(
-                        "YALCIN PRO - GRUP BASARISIZ:",
-                        index,
-                        "| HISSE:",
-                        len(batch)
+                        "YALCIN PRO - YAHOO FALLBACK:",
+                        len(batches),
+                        "GRUP"
                     )
 
-                    return 0, len(batch)
+                    def refresh_one_batch(index, batch):
 
-                with ThreadPoolExecutor(
-                    max_workers=4,
-                    thread_name_prefix="yalcin-price"
-                ) as executor:
-
-                    futures = {
-                        executor.submit(
-                            refresh_one_batch,
+                        print(
+                            "YALCIN PRO - GRUP:",
                             index,
-                            batch
-                        ): index
-                        for index, batch in enumerate(
-                            batches,
-                            start=1
+                            "/",
+                            len(batches),
+                            "|",
+                            len(batch),
+                            "HISSE"
                         )
-                    }
 
-                    for future in as_completed(futures):
-                        index = futures[future]
+                        for retry in range(RETRY_COUNT + 1):
 
-                        try:
-                            updated, missing = future.result()
-                            total_updated += updated
-                            total_missing += missing
+                            try:
 
-                        except Exception as e:
-                            print(
-                                "YALCIN PRO - GRUP FUTURE HATASI:",
+                                results, missing = get_stocks_batch(batch)
+
+                                for result in results:
+
+                                    symbol = normalize_symbol(
+                                        result.get("sembol", "")
+                                    )
+
+                                    if symbol:
+                                        _save_stock_memory(
+                                            symbol,
+                                            result
+                                        )
+
+                                print(
+                                    "YALCIN PRO - GRUP TAMAM:",
+                                    index,
+                                    "| GUNCEL:",
+                                    len(results),
+                                    "| EKSIK:",
+                                    len(missing),
+                                    "| DENEME:",
+                                    retry + 1
+                                )
+
+                                return len(results), len(missing)
+
+                            except Exception as e:
+
+                                print(
+                                    "YALCIN PRO - GRUP HATASI:",
+                                    index,
+                                    "| DENEME:",
+                                    retry + 1,
+                                    e
+                                )
+
+                                if retry < RETRY_COUNT:
+                                    time.sleep(RETRY_WAIT_SECONDS)
+
+                        print(
+                            "YALCIN PRO - GRUP BASARISIZ:",
+                            index,
+                            "| HISSE:",
+                            len(batch)
+                        )
+
+                        return 0, len(batch)
+
+                    with ThreadPoolExecutor(
+                        max_workers=4,
+                        thread_name_prefix="yalcin-price"
+                    ) as executor:
+
+                        futures = {
+                            executor.submit(
+                                refresh_one_batch,
                                 index,
-                                e
+                                batch
+                            ): index
+                            for index, batch in enumerate(
+                                batches,
+                                start=1
                             )
-                            total_missing += len(
-                                batches[index - 1]
-                            )
+                        }
+
+                        for future in as_completed(futures):
+
+                            index = futures[future]
+
+                            try:
+                                updated, missing = future.result()
+                                total_updated += updated
+                                total_missing += missing
+
+                            except Exception as e:
+
+                                print(
+                                    "YALCIN PRO - GRUP FUTURE HATASI:",
+                                    index,
+                                    e
+                                )
+
+                                total_missing += len(
+                                    batches[index - 1]
+                                )
 
                 # CACHE DOSYASINI TEK SEFERDE KAYDET
                 # -------------------------------------------------
@@ -1948,14 +2137,6 @@ def start_background_refresh(
                     cache_count,
                     "| EKSIK:",
                     total_missing
-                )
-
-                print(
-                    "YALCIN PRO - 614 HISSE TURU BİTTİ | "
-                    "GUNCELLENEN:",
-                    total_updated,
-                    "/",
-                    len(refresh_symbols)
                 )
 
                 # -------------------------------------------------
