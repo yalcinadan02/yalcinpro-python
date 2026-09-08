@@ -11,28 +11,32 @@ from html.parser import HTMLParser
 # YALCIN PRO - UCRETSIZ / GECIKMELI BIST VERISI
 # =========================================================
 # Bu surumde:
-# - Yahoo yok
-# - Apinoktam yok
-# - kendi yuzde hesabimiz yok
-# - onceki yenilemeye gore yuzde yok
-# - 614 hisse tek bir canli kaynak snapshot'ından doldurulur
-# - kaynakta yayinlanan "Degisim (%)" dogrudan kullanilir
+# - Yalcin Pro kendi yuzde hesabini YAPMAZ.
+# - Onceki yenilemeye gore degisim hesaplanmaz.
+# - Yerel Armert BIST Data Service (port 8000) /all endpoint'i kullanilir.
+# - Servisin change_percent alani dogrudan degisimYuzde olarak kullanilir.
+# - 614 aktif hisse korunur; kaynakta bulunanlardan doldurulur.
 #
-# Veri kaynagi: Is Yatirim web tablosu.
-# Bu kaynak Borsa Istanbul'un resmi anlik veri akisinin kendisi degildir;
-# dolayisiyla gecikme/veri farki olabilir.
+# Veri zinciri:
+# Armert BIST Data Service (Yahoo Chart, gecikmeli) -> Yalcin Pro server.py -> Android
 
 app = Flask(__name__)
 
+# =========================================================
+# YALCIN PRO - 614 HISSE / YAKLASIK 15 DK GECIKMELI VERI
+# =========================================================
+# Mimari:
+#   BIST Data Service :8000  ->  Yalcin Pro server.py :5000  ->  Android
+#
+# Mevcut 614 aktif sembol listesini korur.
+# Yeni servisin /all endpointinden gelen fiyat ve gunluk degisim yuzdesini
+# dogrudan Android'e aktarir. Kendi yuzde hesabini yapmaz.
+
 TARGET = 614
 REFRESH_SECONDS = 30
-SNAPSHOT_TTL = 5
+SOURCE_URL = os.environ.get("BIST_DATA_SERVICE_URL", "http://127.0.0.1:8000")
+SOURCE_ALL_URL = SOURCE_URL.rstrip("/") + "/all"
 ACTIVE_CACHE_FILE = "yalcin_pro_active_symbols.json"
-
-ISYATIRIM_URL = (
-    "https://www.isyatirim.com.tr/tr-tr/Analiz/hisse/"
-    "Sayfalar/default.aspx"
-)
 
 _symbol_list = []
 _symbol_lock = threading.Lock()
@@ -48,7 +52,7 @@ last_refresh = {
     "updated": 0,
     "missing": 0,
     "total": TARGET,
-    "timestamp": 0
+    "timestamp": 0,
 }
 
 
@@ -65,67 +69,85 @@ def normalize_symbol(value):
     return s
 
 
-def parse_number(value):
-    if value is None:
-        return None
-    s = str(value).replace("\xa0", " ").replace("%", "").strip()
-    if not s:
-        return None
-    # Is Yatirim Turkce sayi bicimi: 1.234,56
-    s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
+def fetch_source_all():
+    """Yerel BIST Data Service /all endpointinden toplu quote verisini al."""
+    req = urllib.request.Request(
+        SOURCE_ALL_URL,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "YalcinPro/1.0",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
 
+    with urllib.request.urlopen(req, timeout=20) as response:
+        raw = response.read().decode("utf-8", errors="ignore")
 
-class TableParser(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.in_tr = False
-        self.in_cell = False
-        self.cell_index = -1
-        self.cell_text = []
-        self.row = []
-        self.rows = []
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        return {}
 
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "tr":
-            if self.in_tr:
-                self.finish_row()
-            self.in_tr = True
-            self.in_cell = False
-            self.cell_index = -1
-            self.cell_text = []
-            self.row = []
-        elif self.in_tr and tag in ("td", "th"):
-            self.cell_index += 1
-            self.in_cell = True
-            self.cell_text = []
+    quotes = payload.get("quotes")
+    if not isinstance(quotes, list):
+        quotes = payload.get("data")
+    if not isinstance(quotes, list):
+        return {}
 
-    def handle_data(self, data):
-        if self.in_tr and self.in_cell:
-            self.cell_text.append(data)
+    result = {}
 
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if self.in_tr and self.in_cell and tag in ("td", "th"):
-            value = re.sub(r"\s+", " ", " ".join(self.cell_text)).strip()
-            self.row.append(value)
-            self.in_cell = False
-            self.cell_text = []
-        elif tag == "tr" and self.in_tr:
-            self.finish_row()
+    for q in quotes:
+        if not isinstance(q, dict):
+            continue
 
-    def finish_row(self):
-        if self.row:
-            self.rows.append(self.row)
-        self.in_tr = False
-        self.in_cell = False
-        self.cell_index = -1
-        self.cell_text = []
-        self.row = []
+        symbol = normalize_symbol(
+            q.get("symbol") or q.get("sembol") or q.get("ticker")
+        )
+        if not symbol:
+            continue
+
+        price = q.get("price", q.get("fiyat"))
+        previous = q.get(
+            "previous_close",
+            q.get("previousClose", q.get("oncekiKapanis")),
+        )
+        change_percent = q.get(
+            "change_percent",
+            q.get("changePercent", q.get("degisimYuzde")),
+        )
+        currency = q.get("currency", q.get("paraBirimi", "TRY"))
+
+        try:
+            price = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
+
+        try:
+            previous = float(previous) if previous is not None else None
+        except (TypeError, ValueError):
+            previous = None
+
+        try:
+            change_percent = (
+                float(change_percent)
+                if change_percent is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            change_percent = None
+
+        if price is None or price <= 0 or change_percent is None:
+            continue
+
+        result[symbol] = {
+            "sembol": symbol,
+            "fiyat": round(price, 2),
+            "oncekiKapanis": round(previous, 2) if previous is not None else None,
+            "degisimYuzde": round(change_percent, 2),
+            "paraBirimi": str(currency or "TRY"),
+        }
+
+    return result
 
 
 def download_snapshot():
@@ -134,126 +156,45 @@ def download_snapshot():
     now = time.time()
 
     with _snapshot_lock:
-        if _snapshot and now - _snapshot_time < SNAPSHOT_TTL:
+        if _snapshot and now - _snapshot_time < 5:
             return dict(_snapshot)
 
-        print("YALCIN PRO - IS YATIRIM SNAPSHOT ALINIYOR...")
+    print("YALCIN PRO - YENI BIST DATA SERVICE /all ALINIYOR...")
+    print("YALCIN PRO - KAYNAK:", SOURCE_ALL_URL)
 
-        try:
-            url = ISYATIRIM_URL + "?yalcin_live=" + str(int(now * 1000))
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
-                    "Cache-Control": "no-cache",
-                    "Pragma": "no-cache",
-                },
-            )
+    try:
+        result = fetch_source_all()
 
-            with urllib.request.urlopen(req, timeout=20) as r:
-                html = r.read().decode("utf-8", errors="ignore")
+        print(
+            "YALCIN PRO - YENI KAYNAKTAN GELEN GECERLI HISSE:",
+            len(result),
+        )
 
-            parser = TableParser()
-            parser.feed(html)
-
-            print("YALCIN PRO - IS YATIRIM HTML SATIR:", len(parser.rows))
-
-            header = None
-            price_i = None
-            change_i = None
-
-            for i, row in enumerate(parser.rows):
-                cells = [re.sub(r"\s+", " ", str(x)).strip().lower() for x in row]
-                has_hisse = any(x == "hisse" or x.startswith("hisse ") for x in cells)
-                if not has_hisse:
-                    continue
-
-                p = next((j for j, x in enumerate(cells) if "son fiyat" in x), None)
-                c = next(
-                    (j for j, x in enumerate(cells)
-                     if "değişim (%)" in x or "degisim (%)" in x),
-                    None
-                )
-                if p is not None and c is not None:
-                    header, price_i, change_i = i, p, c
-                    break
-
-            print(
-                "YALCIN PRO - IS YATIRIM HEADER:",
-                header, "| FIYAT:", price_i, "| DEG:", change_i
-            )
-
-            if header is None:
-                return {}
-
-            result = {}
-
-            for row in parser.rows[header + 1:]:
-                if max(price_i, change_i) >= len(row):
-                    continue
-
-                raw = str(row[0])
-                # Ilk gecerli sembol.
-                candidates = re.findall(r"\b[A-Z0-9]{2,8}\b", raw.upper())
-                symbol = ""
-                for candidate in candidates:
-                    n = normalize_symbol(candidate)
-                    if n:
-                        symbol = n
-                        break
-
-                if not symbol:
-                    continue
-
-                price = parse_number(row[price_i])
-                change = parse_number(row[change_i])
-
-                if price is None or price <= 0 or change is None:
-                    continue
-
-                # Onceki kapanis sadece bilgi amacli geri hesaplanir.
-                # Android'deki degisim YUZDESI bu degerden hesaplanmaz.
-                denom = 1.0 + change / 100.0
-                previous = price / denom if denom > 0 else price
-
-                result[symbol] = {
-                    "sembol": symbol,
-                    "fiyat": round(price, 2),
-                    "oncekiKapanis": round(previous, 2),
-                    "degisimYuzde": round(change, 2),
-                    "paraBirimi": "TRY",
-                }
-
-            print("YALCIN PRO - IS YATIRIM SNAPSHOT:", len(result), "HISSE")
-
-            for s in ("ADEL", "THYAO", "AKBNK", "GARAN", "YUNSA", "VERUS", "USHOL"):
-                if s in result:
-                    x = result[s]
-                    print(
-                        f"YALCIN PRO - KAYNAK: {s} | "
-                        f"FIYAT={x['fiyat']} | "
-                        f"GUNLUK_DEG=%{x['degisimYuzde']}"
-                    )
-
-            if len(result) < TARGET:
+        for s in ("ADEL", "THYAO", "AKBNK", "GARAN", "ASELS"):
+            if s in result:
+                x = result[s]
                 print(
-                    "YALCIN PRO - KAYNAKTA YETERLI HISSE YOK:",
-                    len(result), "/", TARGET
+                    f"YALCIN PRO - KAYNAK {s}: "
+                    f"FIYAT={x['fiyat']} | "
+                    f"GUNLUK_DEG=%{x['degisimYuzde']}"
                 )
-                return {}
 
+        if len(result) < TARGET:
+            print(
+                "YALCIN PRO - KAYNAKTA YETERLI HISSE YOK:",
+                len(result), "/", TARGET
+            )
+            return {}
+
+        with _snapshot_lock:
             _snapshot = result
             _snapshot_time = time.time()
-            return dict(result)
 
-        except Exception as e:
-            print("YALCIN PRO - SNAPSHOT HATASI:", e)
-            return {}
+        return dict(result)
+
+    except Exception as e:
+        print("YALCIN PRO - YENI KAYNAK HATASI:", e)
+        return {}
 
 
 def load_active_symbols():
@@ -479,9 +420,9 @@ if __name__ == "__main__":
     print("=" * 60)
     print("YALCIN PRO SERVER - UCRETSIZ / GECIKMELI BIST")
     print("HEDEF:", TARGET, "HISSE")
-    print("KAYNAK: IS YATIRIM")
+    print("KAYNAK: LOCAL BIST DATA SERVICE / Yahoo Chart")
     print("YENILEME:", REFRESH_SECONDS, "SANIYE")
-    print("BATCH: YOK - TEK SNAPSHOT")
+    print("BATCH: YOK - TEK /all SNAPSHOT")
     print("=" * 60)
 
     # Ilk snapshot'i server acilisinda al.
