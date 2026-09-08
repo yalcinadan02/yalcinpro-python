@@ -732,11 +732,38 @@ def _discover_active_symbols_from_kap(kap_symbols):
                 )
 
     # KAP sırasını koru; set sırası kullanma.
-    ordered = [
+    verified_ordered = [
         symbol
         for symbol in candidates
         if symbol in active
     ]
+
+    # Yahoo bazı geçerli BIST sembollerini geçici olarak döndürmeyebilir.
+    # Ana evrenin 614 hissede kalması için doğrulanamayan KAP
+    # sembollerini tamamlayıcı olarak ekliyoruz. Bu hisselerin fiyatı
+    # o anda yoksa /stocks içinde 0.0 ile korunur; arka plan yenilemesi
+    # sonraki turlarda gerçek fiyatı tekrar dener.
+    ordered = verified_ordered[:TARGET_BIST_STOCK_COUNT]
+
+    if len(ordered) < TARGET_BIST_STOCK_COUNT:
+        verified_set = set(ordered)
+        fallback_symbols = [
+            symbol
+            for symbol in candidates
+            if symbol not in verified_set
+        ]
+
+        needed = TARGET_BIST_STOCK_COUNT - len(ordered)
+        ordered.extend(fallback_symbols[:needed])
+
+        print(
+            "YALCIN PRO - KAP TAMAMLAMA:",
+            min(len(fallback_symbols), needed),
+            "EK SEMBOL | DOGRULANMIS:",
+            len(verified_ordered),
+            "| HEDEF:",
+            TARGET_BIST_STOCK_COUNT
+        )
 
     if len(ordered) > TARGET_BIST_STOCK_COUNT:
         ordered = ordered[:TARGET_BIST_STOCK_COUNT]
@@ -745,11 +772,11 @@ def _discover_active_symbols_from_kap(kap_symbols):
         "YALCIN PRO - AKTIF BIST EVRENI:",
         len(ordered),
         "/", TARGET_BIST_STOCK_COUNT,
-        "HISSE"
+        "HISSE | YAHOO DOGRULANMIS:",
+        len(verified_ordered)
     )
 
     return ordered
-
 
 def _refresh_symbol_universe(force=False):
     """KAP listesini periyodik olarak yeniden alır ve Yahoo ile doğrular."""
@@ -805,15 +832,18 @@ def _refresh_symbol_universe(force=False):
 
 def get_bist_symbols():
     """
-    HTTP isteğini KAP/Yahoo keşfine bağlamaz.
-    Server açıldıktan sonra keşif arka planda yapılır.
-    Böylece Android isteği uzun süre bloklanmaz.
+    Server'ın Android'e vereceği ana BIST evrenini döndürür.
+    Evren 614 ile sınırlandırılır; fiyatı henüz cache'e gelmemiş
+    semboller de listeden çıkarılmaz.
     """
     with _symbol_list_lock:
         current = list(_symbol_list)
 
     if not current:
         current = _load_active_symbol_cache()
+
+    if len(current) > TARGET_BIST_STOCK_COUNT:
+        current = current[:TARGET_BIST_STOCK_COUNT]
 
     return current
 
@@ -2256,18 +2286,26 @@ def stocks():
                 stale_count += 1
 
     # ---------------------------------------------------------
-    # ANDROID SIRASINI KORU
+    # ANDROID SIRASINI KORU + EKSIKLERI DE GONDER
     # ---------------------------------------------------------
+    # Bazı hisselerin Yahoo verisi o anda yoksa listeyi 438'e
+    # düşürmüyoruz. Sembol kaydı 0.0 değerleriyle korunuyor.
+    # Arka plan yenilemesi sonraki turlarda gerçek fiyatı doldurur.
+    ordered_results = []
 
-    ordered_results = [
+    for symbol in symbols:
+        result = result_map.get(symbol)
 
-        result_map[symbol]
-
-        for symbol in symbols
-
-        if symbol in result_map
-
-    ]
+        if result is not None:
+            ordered_results.append(result)
+        else:
+            ordered_results.append({
+                "sembol": symbol,
+                "fiyat": 0.0,
+                "oncekiKapanis": 0.0,
+                "degisimYuzde": 0.0,
+                "paraBirimi": "TRY"
+            })
 
     # ---------------------------------------------------------
     # EKSİKLER
