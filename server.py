@@ -1775,14 +1775,15 @@ def start_background_refresh(
                 )
 
                 # -------------------------------------------------
-                # HER GRUP
+                # -------------------------------------------------
+                # TÜM GRUPLARI KONTROLLÜ PARALEL YENİLE
+                # -------------------------------------------------
+                # 25 grup artık 4 işçiyle aynı anda çalışır.
+                # Böylece listenin sonundaki VERUS gibi hisseler
+                # ilk grubun bitmesini beklemez.
                 # -------------------------------------------------
 
-                for index, batch in enumerate(
-                    batches,
-                    start=1
-                ):
-
+                def refresh_one_batch(index, batch):
                     print(
                         "YALCIN PRO - GRUP:",
                         index,
@@ -1793,58 +1794,20 @@ def start_background_refresh(
                         "HISSE"
                     )
 
-                    success = False
-
-                    # -------------------------------------------------
-                    # RETRY
-                    # -------------------------------------------------
-
-                    for retry in range(
-                        RETRY_COUNT + 1
-                    ):
-
+                    for retry in range(RETRY_COUNT + 1):
                         try:
-
-                            results, missing = (
-                                get_stocks_batch(
-                                    batch
-                                )
-                            )
-
-                            # -----------------------------------------
-                            # BAŞARILI VERİLERİ CACHE
-                            # -----------------------------------------
+                            results, missing = get_stocks_batch(batch)
 
                             for result in results:
-
                                 symbol = normalize_symbol(
-
-                                    result.get(
-                                        "sembol",
-                                        ""
-                                    )
-
+                                    result.get("sembol", "")
                                 )
 
                                 if symbol:
-
                                     _save_stock_memory(
-
                                         symbol,
-
                                         result
-
                                     )
-
-                            total_updated += (
-                                len(results)
-                            )
-
-                            total_missing += (
-                                len(missing)
-                            )
-
-                            success = True
 
                             print(
                                 "YALCIN PRO - GRUP TAMAM:",
@@ -1857,10 +1820,9 @@ def start_background_refresh(
                                 retry + 1
                             )
 
-                            break
+                            return len(results), len(missing)
 
                         except Exception as e:
-
                             print(
                                 "YALCIN PRO - GRUP HATASI:",
                                 index,
@@ -1870,28 +1832,52 @@ def start_background_refresh(
                             )
 
                             if retry < RETRY_COUNT:
+                                time.sleep(RETRY_WAIT_SECONDS)
 
-                                time.sleep(
-                                    RETRY_WAIT_SECONDS
-                                )
+                    print(
+                        "YALCIN PRO - GRUP BASARISIZ:",
+                        index,
+                        "| HISSE:",
+                        len(batch)
+                    )
 
-                    # -------------------------------------------------
-                    # BAŞARISIZSA ESKİ CACHE KORUNUR
-                    # -------------------------------------------------
+                    return 0, len(batch)
 
-                    if not success:
+                with ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix="yalcin-price"
+                ) as executor:
 
-                        print(
-                            "YALCIN PRO - GRUP BASARISIZ:",
+                    futures = {
+                        executor.submit(
+                            refresh_one_batch,
                             index,
-                            "| HISSE:",
-                            len(batch)
+                            batch
+                        ): index
+                        for index, batch in enumerate(
+                            batches,
+                            start=1
                         )
+                    }
 
-                    # Gruplar arası kısa bekleme
-                    time.sleep(0.5)
+                    for future in as_completed(futures):
+                        index = futures[future]
 
-                # -------------------------------------------------
+                        try:
+                            updated, missing = future.result()
+                            total_updated += updated
+                            total_missing += missing
+
+                        except Exception as e:
+                            print(
+                                "YALCIN PRO - GRUP FUTURE HATASI:",
+                                index,
+                                e
+                            )
+                            total_missing += len(
+                                batches[index - 1]
+                            )
+
                 # CACHE DOSYASINI TEK SEFERDE KAYDET
                 # -------------------------------------------------
 
@@ -2325,6 +2311,25 @@ def stocks():
         "/",
         len(symbols)
     )
+
+    for debug_symbol in (
+        "THYAO",
+        "VERUS",
+        "USHOL",
+        "YUNSA",
+        "AKBNK"
+    ):
+        debug_item = result_map.get(debug_symbol)
+
+        if debug_item:
+            print(
+                "YALCIN PRO - /stocks FIYAT:",
+                debug_symbol,
+                "=",
+                debug_item.get("fiyat"),
+                "| DEG:",
+                debug_item.get("degisimYuzde")
+            )
 
     print(
         "================================================="
