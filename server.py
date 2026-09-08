@@ -804,16 +804,18 @@ def _refresh_symbol_universe(force=False):
 
 
 def get_bist_symbols():
-    # Önce doğrulanmış aktif cache.
+    """
+    HTTP isteğini KAP/Yahoo keşfine bağlamaz.
+    Server açıldıktan sonra keşif arka planda yapılır.
+    Böylece Android isteği uzun süre bloklanmaz.
+    """
     with _symbol_list_lock:
         current = list(_symbol_list)
 
     if not current:
         current = _load_active_symbol_cache()
 
-    # 614'ten azsa eski/eksik cache kesinlikle kullanılmaz.
-    needs_discovery = len(current) < TARGET_BIST_STOCK_COUNT
-    return _refresh_symbol_universe(force=needs_discovery)
+    return current
 
 
 # =============================================================
@@ -2343,30 +2345,74 @@ def stocks():
 # SERVER
 # =============================================================
 
+def start_server_bootstrap():
+    """
+    Server portu açıldıktan sonra KAP -> Yahoo sembol keşfini
+    arka planda yapar. Keşif tamamlanınca canlı fiyat yenilemesi
+    başlatılır. Böylece Flask 5000 portunu bekletmez.
+    """
+
+    def bootstrap_worker():
+        global _last_symbol_refresh
+
+        try:
+            print(
+                "YALCIN PRO - ARKA PLAN SEMBOL KESFI BASLADI"
+            )
+
+            with _symbol_list_lock:
+                current = list(_symbol_list)
+
+            if len(current) >= TARGET_BIST_STOCK_COUNT:
+                print(
+                    "YALCIN PRO - HAZIR AKTIF EVREN:",
+                    len(current),
+                    "HISSE"
+                )
+
+                _last_symbol_refresh = time.time()
+                start_background_refresh(current)
+                return
+
+            discovered = _refresh_symbol_universe(force=True)
+
+            if discovered:
+                print(
+                    "YALCIN PRO - ARKA PLAN SEMBOL KESFI TAMAM:",
+                    len(discovered),
+                    "HISSE"
+                )
+                start_background_refresh(discovered)
+            else:
+                print(
+                    "YALCIN PRO - SEMBOL KESFI SONUC VERMEDI"
+                )
+
+        except Exception as e:
+            print(
+                "YALCIN PRO - BASLANGIC SEMBOL KESFI HATASI:",
+                e
+            )
+
+    thread = threading.Thread(
+        target=bootstrap_worker,
+        daemon=True,
+        name="yalcin-symbol-bootstrap"
+    )
+    thread.start()
+
+
+# =============================================================
+# SERVER
+# =============================================================
+
 if __name__ == "__main__":
 
-    # ---------------------------------------------------------
-    # İLK AÇILIŞTA GÜNCEL BIST EVRENİNİ OLUŞTUR
-    # KAP -> Yahoo doğrulama -> aktif sembol cache
-    # Böylece server açıldığında sembol listesi hazır olur.
-    # ---------------------------------------------------------
-
-    initial_symbols = get_bist_symbols()
-
-    # Fiyat arka planını Android isteğini beklemeden başlat.
-    start_background_refresh(initial_symbols)
-
     with _cache_lock:
-
-        cache_count = len(
-            _stock_cache
-        )
+        cache_count = len(_stock_cache)
 
     with _symbol_list_lock:
-
-        symbol_count = len(
-            _symbol_list
-        )
+        symbol_count = len(_symbol_list)
 
     print(
         "================================================="
@@ -2420,6 +2466,10 @@ if __name__ == "__main__":
         "================================================="
     )
 
+    # Flask önce 5000 portunu açacak.
+    # KAP/Yahoo sembol keşfi ayrı thread'de çalışacak.
+    start_server_bootstrap()
+
     port = int(
         os.environ.get(
             "PORT",
@@ -2428,13 +2478,9 @@ if __name__ == "__main__":
     )
 
     app.run(
-
         host="0.0.0.0",
-
         port=port,
-
         debug=False,
-
         threaded=True
-
     )
+
