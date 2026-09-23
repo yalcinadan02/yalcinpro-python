@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
@@ -10,16 +11,28 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ============================================================
-# YALCIN PRO - UCRETSIZ / GECIKMELI BIST SUNUCUSU
-# Kaynak: Asenax BIST /all (Midas kaynakli, yaklasik 15 dk gecikmeli)
+# YALCIN PRO - 614 BIST HISSE
+# Yahoo Finance Chart API tabanli, cache'li sunucu
+# Bilgisayar / PowerShell / ADB gerekmez.
 # ============================================================
 
-SOURCE_URL = "https://api.asenax.com/bist/all/"
+TARGET = 614
 SYMBOL_FILE = "yalcin_pro_active_symbols.json"
 
-TARGET = 614
+# Yahoo'yu gereksiz yere hizli bombardimana tutmamak icin
+# kontrollu paralellik.
+WORKERS = 6
+REQUEST_TIMEOUT = 15
+RETRY_COUNT = 2
 REFRESH_SECONDS = 60
-REQUEST_TIMEOUT = 25
+
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}.IS"
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+})
 
 cache = {}
 last_refresh = {
@@ -27,9 +40,8 @@ last_refresh = {
     "updated": 0,
     "missing": TARGET,
     "total": TARGET,
-    "status": "baslatılıyor",
+    "status": "baslatiliyor",
 }
-
 refresh_lock = threading.Lock()
 
 
@@ -38,55 +50,47 @@ def now_text():
 
 
 def load_symbols():
-    """GitHub'daki 614 sembollük JSON dosyasını mümkün olduğunca esnek okur."""
-    candidates = [
-        os.path.join(os.path.dirname(__file__), SYMBOL_FILE),
-        SYMBOL_FILE,
-    ]
+    path = os.path.join(os.path.dirname(__file__), SYMBOL_FILE)
 
-    path = next((p for p in candidates if os.path.exists(p)), None)
-    if not path:
-        print("YALCIN PRO - SEMBOL DOSYASI BULUNAMADI")
+    if not os.path.exists(path):
+        print("YALCIN PRO - SEMBOL DOSYASI YOK:", path)
         return []
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             obj = json.load(f)
 
-        values = []
+        found = []
 
-        def walk(x):
-            if isinstance(x, str):
-                s = x.strip().upper()
-                if 2 <= len(s) <= 8 and s.replace(".", "").isalnum():
-                    values.append(s)
-            elif isinstance(x, list):
-                for item in x:
-                    walk(item)
-            elif isinstance(x, dict):
-                # Once "symbol/code/sembol" gibi alanlara bak.
-                for key in ("symbol", "code", "sembol", "ticker"):
-                    if key in x:
-                        walk(x[key])
-                # Gerekirse tum alt yapilari tara.
-                for key, value in x.items():
-                    if key not in ("symbol", "code", "sembol", "ticker"):
-                        if isinstance(value, (list, dict)):
-                            walk(value)
+        def add(value):
+            if isinstance(value, str):
+                s = value.strip().upper()
+                s = s.replace(".IS", "")
+                if 2 <= len(s) <= 8 and s.isalnum():
+                    if s not in found:
+                        found.append(s)
 
-        walk(obj)
+        if isinstance(obj, list):
+            for x in obj:
+                if isinstance(x, str):
+                    add(x)
+                elif isinstance(x, dict):
+                    add(x.get("symbol") or x.get("sembol") or x.get("code"))
 
-        # Sirayi koru, tekrarları kaldır.
-        result = []
-        seen = set()
-        for s in values:
-            if s not in seen:
-                seen.add(s)
-                result.append(s)
+        elif isinstance(obj, dict):
+            # Liste iceren ilk uygun alani bul
+            for key in ("symbols", "semboller", "data", "stocks"):
+                value = obj.get(key)
+                if isinstance(value, list):
+                    for x in value:
+                        if isinstance(x, str):
+                            add(x)
+                        elif isinstance(x, dict):
+                            add(x.get("symbol") or x.get("sembol") or x.get("code"))
+                    break
 
-        if result:
-            print(f"YALCIN PRO - AKTIF SEMBOL CACHE: {len(result)} HISSE")
-        return result
+        print(f"YALCIN PRO - AKTIF SEMBOL: {len(found)} / {TARGET}")
+        return found[:TARGET]
 
     except Exception as e:
         print("YALCIN PRO - SEMBOL OKUMA HATASI:", repr(e))
@@ -94,221 +98,109 @@ def load_symbols():
 
 
 SYMBOLS = load_symbols()
-if not SYMBOLS:
-    # Dosya yoksa uygulamanın tamamen çalışmasını engelleme.
-    SYMBOLS = []
 
 
-def first_value(d, keys, default=None):
-    if not isinstance(d, dict):
-        return default
-    for key in keys:
-        if key in d and d[key] not in (None, ""):
-            return d[key]
-    return default
+def fetch_one(symbol):
+    """Tek hisse icin Yahoo Chart verisini alir."""
+    url = YAHOO_URL.format(symbol)
 
-
-def to_float(value):
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    try:
-        text = str(value).strip()
-        if not text:
-            return None
-        # Türkçe sayı formatı desteği
-        text = text.replace("%", "").replace(" ", "")
-        if "," in text and "." in text:
-            # 1.234,56
-            if text.rfind(",") > text.rfind("."):
-                text = text.replace(".", "").replace(",", ".")
-        else:
-            text = text.replace(",", ".")
-        return float(text)
-    except Exception:
-        return None
-
-
-def unwrap_source(obj):
-    """Asenax cevabı liste, data alanı veya iç içe JSON olabilir."""
-    if isinstance(obj, str):
+    for attempt in range(RETRY_COUNT + 1):
         try:
-            return unwrap_source(json.loads(obj))
+            r = session.get(
+                url,
+                params={
+                    "range": "1d",
+                    "interval": "1d",
+                    "events": "div,splits",
+                    "includeAdjustedClose": "true",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if r.status_code == 429:
+                # Rate limit: biraz bekleyip tekrar dene.
+                time.sleep(1.5 * (attempt + 1))
+                continue
+
+            if r.status_code != 200:
+                return None
+
+            payload = r.json()
+            result = (
+                payload.get("chart", {})
+                .get("result", [])
+            )
+
+            if not result:
+                return None
+
+            meta = result[0].get("meta", {})
+
+            price = meta.get("regularMarketPrice")
+            previous = meta.get("previousClose")
+
+            # Bazı cevaplarda regularMarketPrice olmayabilir.
+            if price is None:
+                indicators = result[0].get("indicators", {})
+                quote = indicators.get("quote", [])
+
+                if quote:
+                    closes = quote[0].get("close", [])
+                    closes = [x for x in closes if x is not None]
+                    if closes:
+                        price = closes[-1]
+
+            if price is None:
+                return None
+
+            price = float(price)
+
+            if previous is not None:
+                previous = float(previous)
+
+            change = None
+            if previous not in (None, 0):
+                change = ((price - previous) / previous) * 100.0
+
+            return {
+                "sembol": symbol,
+                "kod": symbol,
+                "symbol": symbol,
+                "code": symbol,
+                "fiyat": round(price, 4),
+                "price": round(price, 4),
+                "oncekiKapanis": (
+                    round(previous, 4)
+                    if previous is not None else None
+                ),
+                "previousClose": (
+                    round(previous, 4)
+                    if previous is not None else None
+                ),
+                "degisimYuzde": (
+                    round(change, 4)
+                    if change is not None else 0.0
+                ),
+                "changePercent": (
+                    round(change, 4)
+                    if change is not None else 0.0
+                ),
+                "paraBirimi": "TRY",
+                "currency": "TRY",
+            }
+
         except Exception:
-            return []
+            if attempt < RETRY_COUNT:
+                time.sleep(0.8 * (attempt + 1))
+            else:
+                return None
 
-    if isinstance(obj, list):
-        return obj
-
-    if isinstance(obj, dict):
-        for key in ("data", "result", "stocks", "items", "rows"):
-            value = obj.get(key)
-            if isinstance(value, str):
-                try:
-                    value = json.loads(value)
-                except Exception:
-                    pass
-            if isinstance(value, list):
-                return value
-            if isinstance(value, dict):
-                nested = unwrap_source(value)
-                if isinstance(nested, list):
-                    return nested
-
-        # Bazı API'ler sembolü anahtar olarak kullanabilir.
-        dict_items = []
-        for k, v in obj.items():
-            if isinstance(v, dict):
-                item = dict(v)
-                item.setdefault("symbol", k)
-                dict_items.append(item)
-        if dict_items:
-            return dict_items
-
-    return []
+    return None
 
 
-def normalize_item(item):
-    """Farklı alan isimlerini Android uygulamamızın beklediği ortak yapıya çevirir."""
-    if not isinstance(item, dict):
-        return None
-
-    symbol = first_value(
-        item,
-        ["symbol", "code", "sembol", "ticker", "name", "kod"]
-    )
-
-    if symbol is None:
-        return None
-
-    symbol = str(symbol).strip().upper()
-    if not symbol or len(symbol) > 20:
-        return None
-
-    price = to_float(first_value(
-        item,
-        [
-            "price", "fiyat", "last", "lastPrice", "close",
-            "kapanis", "son", "current", "currentPrice"
-        ]
-    ))
-
-    previous = to_float(first_value(
-        item,
-        [
-            "previousClose", "oncekiKapanis", "previous",
-            "prevClose", "prev", "previous_price", "onceki"
-        ]
-    ))
-
-    change = to_float(first_value(
-        item,
-        [
-            "changePercent", "degisimYuzde", "change_percentage",
-            "percent", "percentage", "changePercentDaily",
-            "yuzde", "dailyChangePercent"
-        ]
-    ))
-
-    # Degisim yüzdesi API'de yoksa fiyat ve önceki kapanıştan hesapla.
-    if change is None and price is not None and previous not in (None, 0):
-        change = ((price - previous) / previous) * 100.0
-
-    currency = first_value(
-        item,
-        ["currency", "paraBirimi", "currencyCode", "unit"],
-        "TRY"
-    )
-
-    # Android tarafıyla uyumlu alanlar + İngilizce alias'lar.
-    result = dict(item)
-    result.update({
-        "sembol": symbol,
-        "kod": symbol,
-        "symbol": symbol,
-        "code": symbol,
-        "fiyat": price,
-        "price": price,
-        "oncekiKapanis": previous,
-        "previousClose": previous,
-        "degisimYuzde": change,
-        "changePercent": change,
-        "paraBirimi": str(currency),
-        "currency": str(currency),
-    })
-
-    return result
-
-
-def fetch_source():
-    print("YALCIN PRO - ASENAX /all ALINIYOR...")
-
-    headers = {
-        "User-Agent": "YalcinPro/1.0",
-        "Accept": "application/json,text/plain,*/*",
-        "Cache-Control": "no-cache",
-    }
-
-    try:
-        response = requests.get(
-            SOURCE_URL,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-
-        try:
-            raw = response.json()
-        except Exception:
-            raw = json.loads(response.text)
-
-        rows = unwrap_source(raw)
-
-        normalized = []
-        for row in rows:
-            item = normalize_item(row)
-            if item and item.get("fiyat") is not None:
-                normalized.append(item)
-
-        # Sadece aktif 614 sembolü tut.
-        if SYMBOLS:
-            wanted = set(SYMBOLS)
-            filtered = [
-                x for x in normalized
-                if x.get("symbol") in wanted
-            ]
-
-            # API sembol eşleşmesi farklıysa, yine de gelen gerçek veriyi kaybetme.
-            if filtered:
-                normalized = filtered
-
-        # Aynı sembolü tek kez tut.
-        unique = {}
-        for item in normalized:
-            unique[item["symbol"]] = item
-
-        data = list(unique.values())
-
-        print(
-            f"YALCIN PRO - ASENAX SONUC: "
-            f"{len(data)} HISSE | HTTP {response.status_code}"
-        )
-
-        return data
-
-    except Exception as e:
-        print("YALCIN PRO - ASENAX HATASI:", repr(e))
-        return []
-
-
-def refresh_once(force=False):
+def refresh_all(force=False):
     global cache, last_refresh
 
-    # Aynı anda iki telefon isteğinin iki kez kaynak çağırmasını önle.
     if not refresh_lock.acquire(blocking=False):
         return len(cache)
 
@@ -318,38 +210,82 @@ def refresh_once(force=False):
             if age < REFRESH_SECONDS:
                 return len(cache)
 
-        last_refresh["status"] = "veri_alınıyor"
-        last_refresh["total"] = len(SYMBOLS) if SYMBOLS else TARGET
+        total = len(SYMBOLS)
 
-        data = fetch_source()
-
-        if data:
-            new_cache = {x["symbol"]: x for x in data}
-            cache = new_cache
-
-            wanted_count = len(SYMBOLS) if SYMBOLS else TARGET
-            missing = max(wanted_count - len(cache), 0)
-
+        if total == 0:
             last_refresh.update({
+                "status": "sembol_yok",
                 "timestamp": time.time(),
-                "updated": len(cache),
-                "missing": missing,
-                "total": wanted_count,
-                "status": "güncel",
+                "total": TARGET,
+                "missing": TARGET,
             })
+            return 0
 
-            print(
-                f"YALCIN PRO - CACHE: {len(cache)} | "
-                f"MISSING: {missing}"
-            )
-        else:
-            # Eski cache varsa koru; yoksa hata durumunu açıkça göster.
-            wanted_count = len(SYMBOLS) if SYMBOLS else TARGET
-            last_refresh.update({
-                "missing": max(wanted_count - len(cache), 0),
-                "total": wanted_count,
-                "status": "veri_alınamadı",
-            })
+        last_refresh.update({
+            "status": "veri_aliniyor",
+            "total": total,
+            "missing": total,
+        })
+
+        print(
+            f"YALCIN PRO - YAHOO BASLIYOR: "
+            f"{total} HISSE | {WORKERS} WORKER"
+        )
+
+        new_cache = {}
+        completed = 0
+
+        # 6 paralel istek. 429 gorulurse fetch_one geri cekiliyor.
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = {
+                executor.submit(fetch_one, s): s
+                for s in SYMBOLS
+            }
+
+            for future in as_completed(futures):
+                symbol = futures[future]
+                completed += 1
+
+                try:
+                    item = future.result()
+                except Exception:
+                    item = None
+
+                if item:
+                    new_cache[symbol] = item
+
+                if completed % 25 == 0 or completed == total:
+                    print(
+                        f"YALCIN PRO - YAHOO: "
+                        f"{completed}/{total} | "
+                        f"VERI={len(new_cache)}"
+                    )
+
+        # Eski cache'de veri varsa tamamen silme.
+        # Yeni basarili verileri guncelle.
+        if new_cache:
+            cache.update(new_cache)
+
+        missing = max(total - len(cache), 0)
+
+        last_refresh.update({
+            "timestamp": time.time(),
+            "updated": len(new_cache),
+            "missing": missing,
+            "total": total,
+            "status": (
+                "guncel"
+                if new_cache
+                else "veri_alinamadi"
+            ),
+        })
+
+        print(
+            f"YALCIN PRO - CACHE: "
+            f"{len(cache)}/{total} | "
+            f"YENI: {len(new_cache)} | "
+            f"MISSING: {missing}"
+        )
 
         return len(cache)
 
@@ -362,8 +298,8 @@ def background_loop():
 
     while True:
         try:
-            # İlk yükleme ve sonrasında 60 saniyede bir.
-            refresh_once(force=(not cache))
+            # Ilk veriyi hemen almaya calis.
+            refresh_all(force=(not cache))
         except Exception as e:
             print("YALCIN PRO - ARKA PLAN HATASI:", repr(e))
 
@@ -375,23 +311,22 @@ def home():
     return jsonify({
         "success": True,
         "status": "online",
-        "service": "Yalcin Pro Borsa",
-        "data": len(cache),
-        "symbols": len(SYMBOLS) if SYMBOLS else TARGET,
+        "service": "Yalcin Pro BIST",
+        "source": "Yahoo Finance Chart",
+        "delay": "Yahoo tarafindaki mevcut piyasa gecikmesi",
+        "symbols": len(SYMBOLS),
         "target": TARGET,
-        "source": SOURCE_URL,
-        "delay": "yaklasik 15 dakika",
+        "data": len(cache),
     })
 
 
 @app.route("/health")
 def health():
-    total = len(SYMBOLS) if SYMBOLS else TARGET
     return jsonify({
         "success": True,
         "status": "online",
         "serverTime": now_text(),
-        "symbols": total,
+        "symbols": len(SYMBOLS),
         "target": TARGET,
         "data": len(cache),
         "lastRefresh": last_refresh,
@@ -400,15 +335,12 @@ def health():
 
 @app.route("/stats")
 def stats():
-    total = len(SYMBOLS) if SYMBOLS else TARGET
     return jsonify({
         "success": True,
-        "status": "online",
-        "serverTime": now_text(),
-        "target": total,
-        "symbols": total,
+        "symbols": len(SYMBOLS),
+        "target": TARGET,
         "cached": len(cache),
-        "missing": max(total - len(cache), 0),
+        "missing": max(len(SYMBOLS) - len(cache), 0),
         "lastRefresh": last_refresh,
     })
 
@@ -424,41 +356,44 @@ def symbols():
 
 @app.route("/all")
 def all_stocks():
-    # KRITIK: Arka planın hazır olmasını bekleme.
-    # Telefon /all istediğinde veri yoksa doğrudan çek.
+    # Cache bos ise istegi yapan telefona veri hazirla.
     if not cache:
-        print("YALCIN PRO - /all CACHE BOS -> ANLIK VERI CEKILIYOR")
-        refresh_once(force=True)
+        print("YALCIN PRO - /all CACHE BOS -> YAHOO VERISI CEKILIYOR")
+        refresh_all(force=True)
 
-    data = list(cache.values())
+    data = [
+        cache[s]
+        for s in SYMBOLS
+        if s in cache
+    ]
 
     return jsonify({
         "success": True,
         "status": "online",
         "serverTime": now_text(),
-        "symbols": len(SYMBOLS) if SYMBOLS else TARGET,
+        "symbols": len(SYMBOLS),
         "target": TARGET,
-        "data": data,
         "count": len(data),
+        "data": data,
         "lastRefresh": last_refresh,
     })
 
 
 @app.route("/stock/<symbol>")
 def stock(symbol):
-    symbol = symbol.strip().upper()
+    symbol = symbol.upper().replace(".IS", "").strip()
 
     item = cache.get(symbol)
 
-    # Tek hisse istenip cache boşsa da kaynak yenile.
     if item is None:
-        refresh_once(force=not bool(cache))
-        item = cache.get(symbol)
+        item = fetch_one(symbol)
+
+        if item:
+            cache[symbol] = item
 
     if item is None:
         return jsonify({
             "success": False,
-            "status": "not_found",
             "symbol": symbol,
             "data": None,
         }), 404
@@ -471,20 +406,32 @@ def stock(symbol):
     })
 
 
-# Gunicorn bunu kullanacak.
-# Yerelde: python server.py
-if __name__ == "__main__":
-    print("=" * 60)
-    print("YALCIN PRO SERVER")
-    print(f"HEDEF: {len(SYMBOLS) if SYMBOLS else TARGET} HISSE")
-    print(f"KAYNAK: {SOURCE_URL}")
-    print("GECIKME: YAKLASIK 15 DAKIKA")
-    print(f"YENILEME: {REFRESH_SECONDS} SANIYE")
-    print("=" * 60)
+@app.route("/refresh")
+def manual_refresh():
+    count = refresh_all(force=True)
 
-    # Yerel çalıştırmada arka planı başlat.
-    t = threading.Thread(target=background_loop, daemon=True)
+    return jsonify({
+        "success": count > 0,
+        "status": last_refresh["status"],
+        "data": count,
+        "target": len(SYMBOLS),
+        "lastRefresh": last_refresh,
+    })
+
+
+if __name__ == "__main__":
+    # Yerel calistirma icin.
+    t = threading.Thread(
+        target=background_loop,
+        daemon=True,
+    )
     t.start()
 
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        threaded=True,
+    )
