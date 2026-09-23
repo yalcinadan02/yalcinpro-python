@@ -109,7 +109,9 @@ def fetch_one(symbol):
             r = session.get(
                 url,
                 params={
-                    "range": "1d",
+                    # 5 gunluk veri istiyoruz ki onceki islem gununun
+                    # kapanisini gerekirse chart verisinden bulabilelim.
+                    "range": "5d",
                     "interval": "1d",
                     "events": "div,splits",
                     "includeAdjustedClose": "true",
@@ -139,21 +141,31 @@ def fetch_one(symbol):
             price = meta.get("regularMarketPrice")
             previous = meta.get("previousClose")
 
-            # Bazı cevaplarda regularMarketPrice olmayabilir.
-            if price is None:
-                indicators = result[0].get("indicators", {})
-                quote = indicators.get("quote", [])
+            # Chart kapanislarini da al.
+            # Yahoo bazen meta.previousClose alanini null donduruyor.
+            indicators = result[0].get("indicators", {})
+            quote = indicators.get("quote", [])
+            closes = []
 
-                if quote:
-                    closes = quote[0].get("close", [])
-                    closes = [x for x in closes if x is not None]
-                    if closes:
-                        price = closes[-1]
+            if quote:
+                raw_closes = quote[0].get("close", [])
+                closes = [float(x) for x in raw_closes if x is not None]
+
+            # regularMarketPrice yoksa charttaki son fiyati kullan.
+            if price is None and closes:
+                price = closes[-1]
 
             if price is None:
                 return None
 
             price = float(price)
+
+            # ONEMLI:
+            # Yahoo bazen previousClose=null donduruyor.
+            # Bu durumda 5 gunluk charttan onceki islem gununun
+            # kapanisini buluyoruz.
+            if previous is None and len(closes) >= 2:
+                previous = closes[-2]
 
             if previous is not None:
                 previous = float(previous)
@@ -161,6 +173,13 @@ def fetch_one(symbol):
             change = None
             if previous not in (None, 0):
                 change = ((price - previous) / previous) * 100.0
+
+            if previous is None:
+                print(
+                    f"YALCIN PRO - {symbol}: "
+                    f"ONCEKI KAPANIS BULUNAMADI | "
+                    f"FIYAT={price}"
+                )
 
             return {
                 "sembol": symbol,
