@@ -1,69 +1,42 @@
 from flask import Flask, jsonify
-import concurrent.futures
 import json
 import os
-import re
 import threading
 import time
-
-import yfinance as yf
+import urllib.request
+import urllib.error
+import re
 
 app = Flask(__name__)
 
 # ============================================================
-# YALCIN PRO - UCRETSIZ / GECIKMELI BIST VERI
+# YALCIN PRO - UCRETSIZ / 15 DAKIKA GECIKMELI BIST
 # ============================================================
-# Render + Gunicorn icin hazir.
+# Kaynak:
+#   Asenax / BIST /all
 #
-# Telefon:
-#   Wi-Fi / Mobil Veri
-#          |
-#          v
-#   https://yalcinpro-python.onrender.com
-#          |
-#          v
-#      /stocks veya /all
+# Asenax dokumantasyonuna gore /bist/all/ tum hisseleri
+# Midas kaynakli 15 dakika gecikmeli olarak verir.
 #
-# Veri kaynagi: Yahoo Finance / yfinance (gecikmeli)
+# Render -> Asenax -> cache -> Android
 #
-# ONEMLI:
-# - PC'deki 127.0.0.1:8000 KULLANILMAZ.
-# - ADB KULLANILMAZ.
-# - Render'da "gunicorn server:app" ile calisir.
-# - 614 aktif sembol cache'i kullanilir.
+# PC / PowerShell / ADB / 127.0.0.1:8000 KULLANILMAZ.
 # ============================================================
 
 TARGET = 614
-REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "25"))
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
+REFRESH_SECONDS = 60
 
-ACTIVE_CACHE_FILE = os.environ.get(
-    "ACTIVE_CACHE_FILE",
-    "yalcin_pro_active_symbols.json",
-)
+SOURCE_URL = "https://api.asenax.com/bist/all/"
 
-PERSISTENT_CACHE_FILE = os.environ.get(
-    "PERSISTENT_CACHE_FILE",
-    "yalcin_pro_cache.json",
-)
+SYMBOL_FILE = "yalcin_pro_active_symbols.json"
+CACHE_FILE = "yalcin_pro_cache.json"
 
-INVALID_SYMBOLS = {
-    "DRT", "PWC", "KPMG", "TTK", "BDO", "PKF",
-    "RSM", "BD", "CNS", "HSY", "KARAR", "REFORM",
-}
+symbols = []
+cache = {}
 
-_symbol_list = []
-_symbol_lock = threading.Lock()
-
-_snapshot = {}
-_snapshot_time = 0.0
-_snapshot_lock = threading.Lock()
-
-_background_started = False
-_background_lock = threading.Lock()
-
-_refresh_lock = threading.Lock()
+symbols_lock = threading.Lock()
+cache_lock = threading.Lock()
+refresh_lock = threading.Lock()
 
 last_refresh = {
     "updated": 0,
@@ -73,525 +46,451 @@ last_refresh = {
     "status": "baslatiliyor",
 }
 
+background_started = False
+background_lock = threading.Lock()
+
 
 # ============================================================
-# YARDIMCI FONKSIYONLAR
+# YARDIMCI
 # ============================================================
 
 def normalize_symbol(value):
-    if not value:
+    if value is None:
         return ""
 
-    s = (
-        str(value)
-        .strip()
-        .upper()
-        .replace(".IS", "")
-        .replace("\xa0", "")
-        .replace("\u200b", "")
-        .replace("\ufeff", "")
-    )
+    value = str(value).strip().upper()
 
-    s = re.sub(r"\s+", "", s)
+    value = value.replace(".IS", "")
+    value = value.replace("BIST:", "")
+    value = re.sub(r"\s+", "", value)
 
-    if s in INVALID_SYMBOLS:
+    if not re.fullmatch(r"[A-Z0-9]{2,8}", value):
         return ""
 
-    if not re.fullmatch(r"[A-Z0-9]{2,8}", s):
-        return ""
-
-    return s
+    return value
 
 
-def safe_float(value):
+def number(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    text = text.replace("%", "")
+    text = text.replace("₺", "")
+    text = text.replace("TL", "")
+    text = text.replace("TRY", "")
+    text = text.replace(" ", "")
+
+    # Türkçe sayı biçimi
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "")
+            text = text.replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+
     try:
-        if value is None:
-            return None
-
-        value = float(value)
-
-        if value != value:
-            return None
-
-        return value
-
+        return float(text)
     except Exception:
         return None
 
 
-def chunked(items, size):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+def first_value(item, names):
+    if not isinstance(item, dict):
+        return None
+
+    # Önce doğrudan anahtarlar
+    lowered = {
+        str(k).lower(): v
+        for k, v in item.items()
+    }
+
+    for name in names:
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+
+    # Daha esnek arama
+    for key, value in item.items():
+        k = str(key).lower().replace("_", "").replace("-", "")
+
+        for name in names:
+            n = name.lower().replace("_", "").replace("-", "")
+
+            if k == n:
+                return value
+
+    return None
 
 
 # ============================================================
-# AKTIF 614 HISSE LISTESI
+# 614 SEMBOL
 # ============================================================
 
-def load_active_symbols():
-    global _symbol_list
+def load_symbols():
+    global symbols
 
-    symbols = []
+    loaded = []
 
     try:
-        if os.path.exists(ACTIVE_CACHE_FILE):
-            with open(
-                ACTIVE_CACHE_FILE,
-                "r",
-                encoding="utf-8",
-            ) as f:
-                data = json.load(f)
-
-            if isinstance(data, list):
-                for item in data:
-                    symbol = normalize_symbol(item)
-
-                    if symbol and symbol not in symbols:
-                        symbols.append(symbol)
-
-    except Exception as e:
-        print(
-            "YALCIN PRO - AKTIF SEMBOL CACHE HATASI:",
-            repr(e),
-        )
-
-    with _symbol_lock:
-        _symbol_list = symbols[:TARGET]
-
-    print(
-        "YALCIN PRO - AKTIF SEMBOL CACHE:",
-        len(_symbol_list),
-        "/",
-        TARGET,
-    )
-
-    return list(_symbol_list)
-
-
-def save_active_symbols(symbols):
-    try:
-        cleaned = []
-
-        for item in symbols:
-            symbol = normalize_symbol(item)
-
-            if symbol and symbol not in cleaned:
-                cleaned.append(symbol)
-
-        cleaned = cleaned[:TARGET]
-
-        temp_file = ACTIVE_CACHE_FILE + ".tmp"
-
         with open(
-            temp_file,
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(
-                cleaned,
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-        os.replace(
-            temp_file,
-            ACTIVE_CACHE_FILE,
-        )
-
-    except Exception as e:
-        print(
-            "YALCIN PRO - SEMBOL CACHE KAYDETME HATASI:",
-            repr(e),
-        )
-
-
-def get_symbols():
-    with _symbol_lock:
-        return list(_symbol_list[:TARGET])
-
-
-# ============================================================
-# KALICI FIYAT CACHE
-# ============================================================
-
-def load_persistent_cache():
-    global _snapshot, _snapshot_time
-
-    try:
-        if not os.path.exists(PERSISTENT_CACHE_FILE):
-            return
-
-        with open(
-            PERSISTENT_CACHE_FILE,
+            SYMBOL_FILE,
             "r",
             encoding="utf-8",
         ) as f:
             data = json.load(f)
 
-        if not isinstance(data, dict):
-            return
+        if isinstance(data, list):
+            for item in data:
+                s = normalize_symbol(item)
 
-        cleaned = {}
-
-        for key, value in data.items():
-            symbol = normalize_symbol(key)
-
-            if not symbol or not isinstance(value, dict):
-                continue
-
-            price = safe_float(value.get("fiyat"))
-            previous = safe_float(
-                value.get("oncekiKapanis")
-            )
-            change = safe_float(
-                value.get("degisimYuzde")
-            )
-
-            if price is None or price <= 0:
-                continue
-
-            if change is None:
-                change = 0.0
-
-            cleaned[symbol] = {
-                "sembol": symbol,
-                "fiyat": round(price, 2),
-                "oncekiKapanis": (
-                    round(previous, 2)
-                    if previous is not None
-                    else None
-                ),
-                "degisimYuzde": round(change, 2),
-                "paraBirimi": "TRY",
-            }
-
-        if cleaned:
-            with _snapshot_lock:
-                _snapshot = cleaned
-                _snapshot_time = time.time()
-
-            print(
-                "YALCIN PRO - KALICI CACHE:",
-                len(cleaned),
-                "HISSE",
-            )
+                if s and s not in loaded:
+                    loaded.append(s)
 
     except Exception as e:
         print(
-            "YALCIN PRO - KALICI CACHE HATASI:",
+            "YALCIN PRO - SEMBOL DOSYASI HATASI:",
+            repr(e),
+        )
+
+    with symbols_lock:
+        symbols = loaded[:TARGET]
+
+    print(
+        "YALCIN PRO - AKTIF SEMBOL:",
+        len(symbols),
+        "/",
+        TARGET,
+    )
+
+
+def load_cache():
+    global cache
+
+    try:
+        if not os.path.exists(CACHE_FILE):
+            return
+
+        with open(
+            CACHE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            with cache_lock:
+                cache = data
+
+        print(
+            "YALCIN PRO - CACHE YUKLENDI:",
+            len(cache),
+        )
+
+    except Exception as e:
+        print(
+            "YALCIN PRO - CACHE HATASI:",
             repr(e),
         )
 
 
-def save_persistent_cache(snapshot):
+def save_cache():
     try:
-        temp_file = PERSISTENT_CACHE_FILE + ".tmp"
+        with cache_lock:
+            data = dict(cache)
+
+        temp = CACHE_FILE + ".tmp"
 
         with open(
-            temp_file,
+            temp,
             "w",
             encoding="utf-8",
         ) as f:
             json.dump(
-                snapshot,
+                data,
                 f,
                 ensure_ascii=False,
             )
 
         os.replace(
-            temp_file,
-            PERSISTENT_CACHE_FILE,
+            temp,
+            CACHE_FILE,
         )
 
     except Exception as e:
         print(
-            "YALCIN PRO - FIYAT CACHE KAYDETME HATASI:",
+            "YALCIN PRO - CACHE KAYDETME HATASI:",
             repr(e),
         )
 
 
 # ============================================================
-# YAHOO FINANCE
+# ASENAX /ALL
 # ============================================================
 
-def fetch_batch(symbols):
-    if not symbols:
-        return {}
-
-    tickers = [
-        symbol + ".IS"
-        for symbol in symbols
-    ]
-
-    print(
-        "YALCIN PRO - YAHOO BATCH:",
-        len(tickers),
+def download_source():
+    request = urllib.request.Request(
+        SOURCE_URL,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "Chrome/153.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+        },
+        method="GET",
     )
 
     try:
-        data = yf.download(
-            tickers=tickers,
-            period="5d",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            actions=False,
-            threads=False,
-            progress=False,
+        with urllib.request.urlopen(
+            request,
+            timeout=20,
+        ) as response:
+
+            raw = response.read()
+
+        text = raw.decode(
+            "utf-8-sig",
+            errors="replace",
         )
+
+        return json.loads(text)
 
     except Exception as e:
         print(
-            "YALCIN PRO - YAHOO BATCH HATASI:",
+            "YALCIN PRO - ASENAX HATASI:",
             repr(e),
         )
-        return {}
+        return None
 
-    result = {}
 
-    try:
-        is_multi = (
-            hasattr(data.columns, "levels")
-            and len(data.columns.levels) >= 2
+def find_stock_array(payload):
+    if isinstance(payload, list):
+        return payload
+
+    if not isinstance(payload, dict):
+        return []
+
+    # Olası wrapper alanları
+    for key in (
+        "data",
+        "stocks",
+        "results",
+        "result",
+        "items",
+        "quotes",
+    ):
+        value = payload.get(key)
+
+        if isinstance(value, list):
+            return value
+
+        if isinstance(value, dict):
+            for nested_key in (
+                "data",
+                "stocks",
+                "results",
+                "items",
+            ):
+                nested = value.get(nested_key)
+
+                if isinstance(nested, list):
+                    return nested
+
+    # İlk list alanını bul
+    for value in payload.values():
+        if isinstance(value, list):
+            return value
+
+    return []
+
+
+def parse_source(payload):
+    rows = find_stock_array(payload)
+
+    parsed = {}
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = first_value(
+            item,
+            [
+                "symbol",
+                "sembol",
+                "code",
+                "kod",
+                "ticker",
+                "hisse",
+                "name",
+            ],
         )
 
-        for symbol in symbols:
-            ticker = symbol + ".IS"
+        symbol = normalize_symbol(symbol)
 
-            try:
-                if is_multi:
-                    if ticker not in data.columns.levels[0]:
-                        continue
+        if not symbol:
+            continue
 
-                    frame = data[ticker]
-                else:
-                    frame = data
-
-                if frame is None or frame.empty:
-                    continue
-
-                if "Close" not in frame.columns:
-                    continue
-
-                closes = frame["Close"].dropna()
-
-                if len(closes) < 1:
-                    continue
-
-                price = safe_float(
-                    closes.iloc[-1]
-                )
-
-                if price is None or price <= 0:
-                    continue
-
-                previous = None
-
-                if len(closes) >= 2:
-                    previous = safe_float(
-                        closes.iloc[-2]
-                    )
-
-                if previous is not None and previous > 0:
-                    change = (
-                        (price - previous)
-                        / previous
-                        * 100.0
-                    )
-                else:
-                    change = 0.0
-
-                result[symbol] = {
-                    "sembol": symbol,
-                    "fiyat": round(price, 2),
-                    "oncekiKapanis": (
-                        round(previous, 2)
-                        if previous is not None
-                        else None
-                    ),
-                    "degisimYuzde": round(
-                        change,
-                        2,
-                    ),
-                    "paraBirimi": "TRY",
-                }
-
-            except Exception as e:
-                print(
-                    "YALCIN PRO - HISSE HATASI:",
-                    symbol,
-                    repr(e),
-                )
-
-    except Exception as e:
-        print(
-            "YALCIN PRO - BATCH PARSE HATASI:",
-            repr(e),
+        price = first_value(
+            item,
+            [
+                "price",
+                "fiyat",
+                "last",
+                "lastPrice",
+                "close",
+                "kapanis",
+                "current",
+                "currentPrice",
+            ],
         )
 
-    print(
-        "YALCIN PRO - BATCH SONUCU:",
-        len(result),
-        "/",
-        len(symbols),
-    )
-
-    return result
-
-
-def fetch_all_stocks():
-    symbols = get_symbols()
-
-    if len(symbols) < TARGET:
-        print(
-            "YALCIN PRO - 614 SEMBOL YOK:",
-            len(symbols),
-            "/",
-            TARGET,
+        previous = first_value(
+            item,
+            [
+                "previousClose",
+                "previous_close",
+                "oncekiKapanis",
+                "onceki_kapanis",
+                "prevClose",
+                "prev",
+                "previous",
+            ],
         )
-        return {}
 
-    all_result = {}
-
-    batches = list(
-        chunked(
-            symbols,
-            BATCH_SIZE,
+        change = first_value(
+            item,
+            [
+                "changePercent",
+                "change_percent",
+                "degisimYuzde",
+                "degisim",
+                "change",
+                "percent",
+                "percentage",
+            ],
         )
-    )
 
-    print(
-        "YALCIN PRO - YENILEME:",
-        len(symbols),
-        "HISSE |",
-        len(batches),
-        "BATCH",
-    )
+        price = number(price)
+        previous = number(previous)
+        change = number(change)
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
+        if price is None or price <= 0:
+            continue
 
-        futures = [
-            executor.submit(
-                fetch_batch,
-                batch,
+        # Degisim kaynaktan gelmiyorsa hesapla
+        if change is None and previous and previous > 0:
+            change = (
+                (price - previous)
+                / previous
+                * 100
             )
-            for batch in batches
-        ]
 
-        for future in concurrent.futures.as_completed(
-            futures
-        ):
-            try:
-                batch_result = future.result()
+        if change is None:
+            change = 0.0
 
-                if batch_result:
-                    all_result.update(
-                        batch_result
-                    )
+        parsed[symbol] = {
+            "sembol": symbol,
+            "fiyat": round(price, 2),
+            "oncekiKapanis": (
+                round(previous, 2)
+                if previous is not None
+                else None
+            ),
+            "degisimYuzde": round(change, 2),
+            "paraBirimi": "TRY",
+        }
 
-            except Exception as e:
-                print(
-                    "YALCIN PRO - FUTURE HATASI:",
-                    repr(e),
-                )
-
-    print(
-        "YALCIN PRO - TOPLAM VERI:",
-        len(all_result),
-        "/",
-        TARGET,
-    )
-
-    return all_result
+    return parsed
 
 
 # ============================================================
 # REFRESH
 # ============================================================
 
-def refresh_once(force=False):
-    global _snapshot
-    global _snapshot_time
+def refresh_once():
+    global cache
     global last_refresh
 
-    if not _refresh_lock.acquire(
+    if not refresh_lock.acquire(
         blocking=False
     ):
-        print(
-            "YALCIN PRO - ZATEN YENILENIYOR"
-        )
         return False
 
     try:
-        with _snapshot_lock:
-            old_snapshot = dict(_snapshot)
+        print(
+            "YALCIN PRO - ASENAX /ALL ALINIYOR..."
+        )
 
-        new_snapshot = fetch_all_stocks()
+        payload = download_source()
 
-        if len(new_snapshot) >= TARGET:
-            with _snapshot_lock:
-                _snapshot = new_snapshot
-                _snapshot_time = time.time()
-
-            save_persistent_cache(
-                new_snapshot
-            )
-
+        if payload is None:
             last_refresh = {
-                "updated": len(new_snapshot),
-                "missing": TARGET - len(new_snapshot),
-                "total": TARGET,
+                **last_refresh,
+                "status": "kaynak_hatasi",
                 "timestamp": time.time(),
-                "status": "guncel",
             }
+            return False
 
-            print(
-                "YALCIN PRO - YENILEME TAMAMLANDI:",
-                len(new_snapshot),
-                "/",
-                TARGET,
-            )
+        parsed = parse_source(payload)
 
-            return True
+        print(
+            "YALCIN PRO - ASENAX VERISI:",
+            len(parsed),
+            "HISSE",
+        )
 
-        # Eksik veri varsa eski cache'i koru.
-        merged = dict(old_snapshot)
-        merged.update(new_snapshot)
+        with symbols_lock:
+            wanted = set(symbols)
 
-        if len(merged) > len(old_snapshot):
-            with _snapshot_lock:
-                _snapshot = merged
-                _snapshot_time = time.time()
+        # Sadece bizim 614'lük listeyi al
+        selected = {
+            s: parsed[s]
+            for s in wanted
+            if s in parsed
+        }
 
-            save_persistent_cache(
-                merged
-            )
+        with cache_lock:
+            # Yeni gelenleri ekle, eskileri koru
+            cache.update(selected)
+            count = len(cache)
+
+        save_cache()
 
         last_refresh = {
-            "updated": len(new_snapshot),
-            "missing": TARGET - len(new_snapshot),
+            "updated": len(selected),
+            "missing": max(
+                0,
+                TARGET - len(selected),
+            ),
             "total": TARGET,
             "timestamp": time.time(),
             "status": (
-                "kismi_veri"
-                if new_snapshot
-                else "veri_alinamadi"
+                "guncel"
+                if len(selected) > 0
+                else "veri_yok"
             ),
         }
 
         print(
-            "YALCIN PRO - KISMI YENILEME:",
-            len(new_snapshot),
+            "YALCIN PRO - CACHE:",
+            count,
             "/",
             TARGET,
-            "| CACHE:",
-            len(merged),
         )
 
-        return bool(new_snapshot)
+        return len(selected) > 0
 
     except Exception as e:
         print(
@@ -608,7 +507,7 @@ def refresh_once(force=False):
         return False
 
     finally:
-        _refresh_lock.release()
+        refresh_lock.release()
 
 
 def background_worker():
@@ -616,35 +515,29 @@ def background_worker():
         "YALCIN PRO - ARKA PLAN BASLADI"
     )
 
-    refresh_once(force=True)
+    # İlk veri
+    refresh_once()
 
     while True:
         time.sleep(
             REFRESH_SECONDS
         )
-
-        try:
-            refresh_once()
-        except Exception as e:
-            print(
-                "YALCIN PRO - ARKA PLAN HATASI:",
-                repr(e),
-            )
+        refresh_once()
 
 
 def start_background():
-    global _background_started
+    global background_started
 
-    with _background_lock:
-        if _background_started:
+    with background_lock:
+        if background_started:
             return
 
-        _background_started = True
+        background_started = True
 
     thread = threading.Thread(
         target=background_worker,
         daemon=True,
-        name="yalcin-refresh",
+        name="yalcin-asenax",
     )
 
     thread.start()
@@ -656,28 +549,32 @@ def start_background():
 
 @app.route("/")
 def home():
-    with _snapshot_lock:
-        data_count = len(_snapshot)
+    with cache_lock:
+        count = len(cache)
 
     return jsonify({
         "success": True,
-        "message": "Yalcin Pro BIST Veri Servisi calisiyor",
+        "message": "YALCIN PRO BIST SERVISI AKTIF",
+        "source": "Asenax /all",
+        "delay": "15 dakika",
         "target": TARGET,
-        "symbols": len(get_symbols()),
-        "data": data_count,
+        "data": count,
     })
 
 
 @app.route("/health")
 def health():
-    with _snapshot_lock:
-        data_count = len(_snapshot)
+    with cache_lock:
+        count = len(cache)
+
+    with symbols_lock:
+        symbol_count = len(symbols)
 
     return jsonify({
         "success": True,
         "status": "online",
-        "symbols": len(get_symbols()),
-        "data": data_count,
+        "symbols": symbol_count,
+        "data": count,
         "target": TARGET,
         "lastRefresh": last_refresh,
         "serverTime": time.strftime(
@@ -688,121 +585,88 @@ def health():
 
 @app.route("/stats")
 def stats():
-    with _snapshot_lock:
-        data_count = len(_snapshot)
+    with cache_lock:
+        count = len(cache)
 
     return jsonify({
         "success": True,
         "target": TARGET,
-        "symbols": len(get_symbols()),
-        "data": data_count,
+        "symbols": len(symbols),
+        "data": count,
         "lastRefresh": last_refresh,
     })
 
 
 @app.route("/symbols")
-def symbols():
-    data = get_symbols()
-
+def symbol_list():
     return jsonify({
-        "success": len(data) == TARGET,
-        "count": len(data),
-        "symbols": data,
+        "success": len(symbols) == TARGET,
+        "count": len(symbols),
+        "symbols": symbols,
     })
 
 
-def get_stock_data():
-    with _snapshot_lock:
-        snapshot = dict(_snapshot)
+def current_data():
+    with cache_lock:
+        snapshot = dict(cache)
 
-    symbols = get_symbols()
+    with symbols_lock:
+        wanted = list(symbols)
 
-    if len(snapshot) < TARGET:
-        refresh_once(force=True)
-
-        with _snapshot_lock:
-            snapshot = dict(_snapshot)
-
-    data = []
-
-    for symbol in symbols:
-        item = snapshot.get(symbol)
-
-        if item:
-            data.append(item)
-
-    return data
-
-
-@app.route("/stocks")
-def stocks():
-    data = get_stock_data()
-
-    if not data:
-        return jsonify({
-            "success": False,
-            "data": [],
-            "error": (
-                "Henuz veri hazir degil. "
-                "Lutfen tekrar deneyin."
-            ),
-        }), 503
-
-    print(
-        "YALCIN PRO - /stocks:",
-        len(data),
-        "/",
-        TARGET,
-    )
-
-    return jsonify({
-        "success": True,
-        "data": data,
-    })
+    return [
+        snapshot[s]
+        for s in wanted
+        if s in snapshot
+    ]
 
 
 @app.route("/all")
 def all_stocks():
-    data = get_stock_data()
+    data = current_data()
+
+    if not data:
+        # Kullanici /all acinca ilk veriyi beklemeden
+        # bir kez daha dene.
+        refresh_once()
+        data = current_data()
 
     if not data:
         return jsonify({
             "success": False,
             "data": [],
-            "error": "Henuz veri hazir degil.",
+            "error": "Veri henuz hazir degil",
         }), 503
-
-    print(
-        "YALCIN PRO - /all:",
-        len(data),
-        "/",
-        TARGET,
-    )
 
     return jsonify({
         "success": True,
+        "count": len(data),
         "data": data,
     })
+
+
+@app.route("/stocks")
+def stocks():
+    return all_stocks()
 
 
 @app.route("/stock/<symbol>")
 def stock(symbol):
     s = normalize_symbol(symbol)
 
-    with _snapshot_lock:
-        item = _snapshot.get(s)
+    with cache_lock:
+        item = cache.get(s)
 
-    if item is None:
-        refresh_once(force=True)
+    if not item:
+        refresh_once()
 
-        with _snapshot_lock:
-            item = _snapshot.get(s)
+        with cache_lock:
+            item = cache.get(s)
 
-    if item is None:
+    if not item:
         return jsonify({
             "success": False,
             "data": [],
-            "error": f"{s} icin veri bulunamadi",
+            "error": f"{s} bulunamadi",
         }), 404
 
     return jsonify({
@@ -813,43 +677,39 @@ def stock(symbol):
 
 @app.route("/refresh")
 def manual_refresh():
-    ok = refresh_once(force=True)
+    ok = refresh_once()
 
-    with _snapshot_lock:
-        count = len(_snapshot)
+    with cache_lock:
+        count = len(cache)
 
     return jsonify({
         "success": ok,
-        "dataCount": count,
+        "data": count,
         "target": TARGET,
         "lastRefresh": last_refresh,
     })
 
 
 # ============================================================
-# GUNICORN / RENDER BASLANGICI
-# ============================================================
-# Render:
-#   gunicorn server:app
-#
-# __main__ bloguna guvenmiyoruz; Gunicorn bu dosyayi import
-# ettiginde cache ve arka plan yenilemesi burada baslar.
+# RENDER / GUNICORN
 # ============================================================
 
-load_active_symbols()
-load_persistent_cache()
+load_symbols()
+load_cache()
 start_background()
 
 
 if __name__ == "__main__":
+    port = int(
+        os.environ.get(
+            "PORT",
+            "5000",
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                "5000",
-            )
-        ),
+        port=port,
         debug=False,
         threaded=True,
     )
