@@ -297,8 +297,11 @@ def filter_real_bist_equities(symbols):
 
 SYMBOLS = load_symbols()
 
-# Daha once JSON'a eklenmis endeks/fon vb. sembolleri de temizle.
-SYMBOLS = filter_real_bist_equities(SYMBOLS)
+# ONEMLI:
+# Sunucu baslangicinda 600+ sembolu Yahoo'da tek tek kontrol ETME.
+# Bu eski filtreleme sunucunun 5000 portunu acmadan uzun sure beklemesine
+# neden oluyordu. Gercek veri kontrolu fetch_one() sirasinda yapilir.
+SYMBOLS = load_symbols()
 
 # Sembol listesi calisma sirasinda guvenli sekilde guncellenebilsin.
 symbols_lock = threading.Lock()
@@ -427,9 +430,9 @@ def fetch_online_symbols():
             f"YALCIN PRO - ONLINE SEMBOL KAYNAGI: {len(found)} SEMBOL"
         )
 
-        # Sadece gerçek şirket hisselerini bırak.
-        found = filter_real_bist_equities(found)
-
+        # Burada Yahoo'ya tek tek EQUITY kontrolu yapma.
+        # Bu kontrol sunucunun baslangicini/arka planini gereksiz yere yavaslatir.
+        # fetch_one() basarili veri gelmeyen sembolleri zaten cache'e almaz.
         return found
 
     except Exception as e:
@@ -457,10 +460,8 @@ def refresh_symbols_from_online_source(force=False):
     ):
         return False
 
-    # Aynı anda ikinci pahalı sembol taramasını engelle.
-    last_symbol_source_check = now
-
     online = fetch_online_symbols()
+    last_symbol_source_check = now
 
     if not online:
         return False
@@ -1419,7 +1420,6 @@ def stats():
 @app.route("/symbols")
 def symbols():
 
-    # Online sembol taraması HTTP isteğinde çalıştırılmaz.
     refresh_symbols_from_file()
 
     return jsonify({
@@ -1439,8 +1439,7 @@ def symbols():
 @app.route("/all")
 def all_stocks():
 
-    # /all isteği içinde pahalı online sembol taraması yapma.
-    # Sembol güncellemesi arka planda yapılır.
+    # Online sembol taramasını HTTP isteği içinde çalıştırma.
     refresh_symbols_from_file()
 
     # --------------------------------------------------------
@@ -1761,8 +1760,6 @@ if __name__ == "__main__":
         ""
     )
 
-
-    print("YALCIN PRO - SERVER BASLATILIYOR | /all BLOKE ETMEZ")
 
     app.run(
 
