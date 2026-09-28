@@ -450,10 +450,8 @@ def refresh_symbols_from_online_source(force=False):
     Online kaynak basariliysa:
     - Yeni semboller otomatik eklenir.
     - Artik kaynakta bulunmayan eski semboller otomatik kaldirilir.
-    - Sembol degistiren hisselerde eski sembol gider, yeni sembol gelir.
-    - Ornek: MARKA kaldirilip USHOL geldiyse MARKA silinir, USHOL eklenir.
-
-    Online kaynak gecici olarak kullanilamazsa mevcut liste korunur.
+    - Sembol degisikligi olursa eski sembol gider, yeni sembol gelir.
+    - Online kaynak gecici olarak kullanilamazsa mevcut liste korunur.
     """
     global SYMBOLS
     global last_symbol_source_check
@@ -498,6 +496,7 @@ def refresh_symbols_from_online_source(force=False):
         added = sorted(new_set - old_set)
         removed = sorted(old_set - new_set)
 
+        # Degisiklik yoksa mevcut sirayi koru.
         if not added and not removed:
             print(
                 "YALCIN PRO - OTOMATIK SEMBOL KONTROLU: "
@@ -505,7 +504,7 @@ def refresh_symbols_from_online_source(force=False):
             )
             return False
 
-        # Online kaynak artik guncel ana sembol listemizdir.
+        # Guncel online liste ana liste olur.
         SYMBOLS = online_clean
 
         print("=================================================")
@@ -523,33 +522,17 @@ def refresh_symbols_from_online_source(force=False):
 
         if removed:
             print(
-                "YALCIN PRO - CIKAN HISSeler: "
+                "YALCIN PRO - CIKAN SEMBOLLER: "
                 + ", ".join(removed)
             )
 
-        if "MARKA" in removed:
-            print(
-                "YALCIN PRO - MARKA ESKI SEMBOL OLARAK "
-                "LISTEDEN KALDIRILDI"
-            )
-
-        if "USHOL" in added:
-            print(
-                "YALCIN PRO - USHOL YENI SEMBOL OLARAK "
-                "LISTEYE EKLENDI"
-            )
-
         try:
-            symbol_path = os.path.join(
+            path = os.path.join(
                 os.path.dirname(__file__),
                 SYMBOL_FILE
             )
 
-            with open(
-                symbol_path,
-                "w",
-                encoding="utf-8"
-            ) as f:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(
                     SYMBOLS,
                     f,
@@ -567,6 +550,7 @@ def refresh_symbols_from_online_source(force=False):
 
         print("=================================================")
         return True
+
 
 def refresh_symbols_from_file():
     """
