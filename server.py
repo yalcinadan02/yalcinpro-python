@@ -32,6 +32,23 @@ TARGET = 0  # 0 = sembol sayisini sinirlama
 
 SYMBOL_FILE = "yalcin_pro_active_symbols.json"
 
+# ============================================================
+# OTOMATIK BIST SEMBOL KAYNAGI
+# ============================================================
+# KAP kaynakli, topluluk tarafindan güncellenen BIST sembol listesi.
+# Sunucu belirli araliklarla bu listeyi kontrol eder.
+SYMBOL_SOURCE_URL = (
+    "https://raw.githubusercontent.com/ahmeterenodaci/"
+    "Istanbul-Stock-Exchange--BIST--including-symbols-and-logos/"
+    "main/bist.json"
+)
+
+# Yeni sembol listesini 6 saatte bir kontrol et.
+SYMBOL_SOURCE_REFRESH_SECONDS = 6 * 60 * 60
+
+last_symbol_source_check = 0
+
+
 # Yahoo'yu gereksiz yere hizli bombardimana tutmamak icin
 # kontrollu paralellik.
 WORKERS = 6
@@ -213,8 +230,156 @@ def load_symbols():
 
 SYMBOLS = load_symbols()
 
-# Sembol listesini çalışma sırasında da yenileyebilmek için kilit.
+# Sembol listesi çalışma sırasında güvenli şekilde güncellenebilsin.
 symbols_lock = threading.Lock()
+
+
+def fetch_online_symbols():
+    """
+    İnternetteki güncel BIST sembol listesini alır.
+    Kaynak erişilemezse mevcut JSON listesi korunur.
+    """
+    try:
+        r = session.get(
+            SYMBOL_SOURCE_URL,
+            timeout=15
+        )
+
+        if r.status_code != 200:
+            print(
+                f"YALCIN PRO - ONLINE SEMBOL KAYNAGI HTTP {r.status_code}"
+            )
+            return []
+
+        payload = r.json()
+        found = []
+
+        def add(value):
+            if not isinstance(value, str):
+                return
+
+            s = value.strip().upper().replace(".IS", "")
+
+            if 2 <= len(s) <= 8 and s.isalnum() and s not in found:
+                found.append(s)
+
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, str):
+                    add(item)
+                elif isinstance(item, dict):
+                    add(
+                        item.get("symbol")
+                        or item.get("sembol")
+                        or item.get("code")
+                    )
+
+        elif isinstance(payload, dict):
+            for key in ("symbols", "semboller", "data", "stocks"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str):
+                            add(item)
+                        elif isinstance(item, dict):
+                            add(
+                                item.get("symbol")
+                                or item.get("sembol")
+                                or item.get("code")
+                            )
+                    break
+
+        print(
+            f"YALCIN PRO - ONLINE SEMBOL KAYNAGI: {len(found)} HISSE"
+        )
+
+        return found
+
+    except Exception as e:
+        print(
+            "YALCIN PRO - ONLINE SEMBOL KAYNAGI HATASI:",
+            repr(e)
+        )
+        return []
+
+
+def refresh_symbols_from_online_source(force=False):
+    """
+    Online sembol kaynağını periyodik olarak kontrol eder.
+    Yeni hisseler mevcut listeye eklenir.
+    """
+    global SYMBOLS
+    global last_symbol_source_check
+
+    now = time.time()
+
+    if (
+        not force
+        and last_symbol_source_check > 0
+        and now - last_symbol_source_check < SYMBOL_SOURCE_REFRESH_SECONDS
+    ):
+        return False
+
+    online = fetch_online_symbols()
+    last_symbol_source_check = now
+
+    if not online:
+        return False
+
+    with symbols_lock:
+        old = list(SYMBOLS)
+        old_set = set(old)
+
+        # Online listedeki yeni sembolleri ekle.
+        added = [s for s in online if s not in old_set]
+
+        # Mevcut sırayı koru; yeni sembolleri sona ekle.
+        if added:
+            SYMBOLS = old + added
+
+            print(
+                f"YALCIN PRO - OTOMATIK YENI HISSE: "
+                f"+{len(added)} | TOPLAM={len(SYMBOLS)}"
+            )
+            print(
+                "YALCIN PRO - YENI SEMBOLLER: "
+                + ", ".join(added)
+            )
+
+            # Yerel sembol dosyasını da güncelle.
+            try:
+                path = os.path.join(
+                    os.path.dirname(__file__),
+                    SYMBOL_FILE
+                )
+
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        SYMBOLS,
+                        f,
+                        ensure_ascii=False,
+                        indent=2
+                    )
+
+                print(
+                    "YALCIN PRO - SEMBOL DOSYASI GUNCELLENDI"
+                )
+
+            except Exception as e:
+                print(
+                    "YALCIN PRO - SEMBOL DOSYASI YAZMA HATASI:",
+                    repr(e)
+                )
+
+            return True
+
+    print(
+        f"YALCIN PRO - OTOMATIK SEMBOL KONTROLU: "
+        f"YENI HISSE YOK | TOPLAM={len(SYMBOLS)}"
+    )
+    return False
+
+
 
 
 def refresh_symbols_from_file():
@@ -983,6 +1148,10 @@ def background_loop():
 
         try:
 
+            # İnternetten güncel BIST sembollerini periyodik kontrol et.
+            refresh_symbols_from_online_source()
+
+
             # ------------------------------------------------
             # SEMBOL LISTESINI KONTROL ET
             # ------------------------------------------------
@@ -1111,6 +1280,7 @@ def stats():
 @app.route("/symbols")
 def symbols():
 
+    refresh_symbols_from_online_source()
     refresh_symbols_from_file()
 
     return jsonify({
@@ -1129,6 +1299,10 @@ def symbols():
 
 @app.route("/all")
 def all_stocks():
+
+    # Önce online BIST sembol listesini kontrol et.
+    refresh_symbols_from_online_source()
+    refresh_symbols_from_file()
 
     # Önce sembol listesini güncelle.
     refresh_symbols_from_file()
