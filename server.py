@@ -449,11 +449,31 @@ def fetch_one(symbol):
 
                         previous = float(dunyh_previous)
 
-                        print(
-                            f"YALCIN PRO - DUNYH DUZELTILDI | "
-                            f"PRICE={price} | "
-                            f"PREVIOUS={previous}"
-                        )
+                        # ------------------------------------------------
+                        # DUNYH OZEL KORUMA
+                        # ------------------------------------------------
+                        # Yahoo DUNYH icin chart/meta verisinde
+                        # 109.10 degerini hatali sekilde donduruyor.
+                        # Bu nedenle bugunku bilinen onceki kapanis
+                        # 44.56 TL kullaniliyor.
+                        #
+                        # SADECE DUNYH etkilenir.
+                        # Diger 613 hissenin kodu degismez.
+                        # ------------------------------------------------
+                        if abs(previous - 109.10) < 0.01:
+                            previous = 44.56
+
+                            print(
+                                f"YALCIN PRO - DUNYH SABIT DUZELTME | "
+                                f"PRICE={price} | "
+                                f"PREVIOUS={previous}"
+                            )
+                        else:
+                            print(
+                                f"YALCIN PRO - DUNYH DUZELTILDI | "
+                                f"PRICE={price} | "
+                                f"PREVIOUS={previous}"
+                            )
 
                     else:
 
