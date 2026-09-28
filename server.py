@@ -409,16 +409,47 @@ def fetch_one(symbol):
 
 
             if previous is not None:
-
                 previous = float(previous)
 
+            # ------------------------------------------------
+            # DUNYH OZEL KONTROL
+            # ------------------------------------------------
+            # Yahoo bazen DUNYH icin current price ile
+            # uyumsuz previousClose dondurebiliyor.
+            # Sadece DUNYH icin chart kapanis degerini
+            # kontrol ediyoruz. Diger hisselere dokunulmaz.
+            # ------------------------------------------------
+
+            if symbol == "DUNYH" and len(closes) >= 2:
+
+                chart_previous = closes[-2]
+
+                if (
+                    chart_previous is not None
+                    and chart_previous > 0
+                ):
+                    chart_previous = float(chart_previous)
+
+                    # Meta previousClose ile chart kapanisi
+                    # arasinda %20'den fazla fark varsa
+                    # Yahoo meta degerini kullanma.
+                    if (
+                        previous is None
+                        or abs(previous - chart_previous)
+                        / chart_previous > 0.20
+                    ):
+                        print(
+                            f"YALCIN PRO - DUNYH OZEL DUZELTME | "
+                            f"YAHOO previousClose={previous} | "
+                            f"CHART previousClose={chart_previous}"
+                        )
+                        previous = chart_previous
 
             # ------------------------------------------------
             # DEGISIM YUZDESI
             # ------------------------------------------------
 
             change = None
-
 
             if previous not in (
                 None,
@@ -429,7 +460,6 @@ def fetch_one(symbol):
                     (price - previous)
                     / previous
                 ) * 100.0
-
 
             # ------------------------------------------------
             # LOG
