@@ -28,7 +28,7 @@ app = Flask(__name__)
 # AYARLAR
 # ============================================================
 
-TARGET = 614
+TARGET = 0  # 0 = sembol sayisini sinirlama
 
 SYMBOL_FILE = "yalcin_pro_active_symbols.json"
 
@@ -195,7 +195,7 @@ def load_symbols():
             f"{len(found)} / {TARGET}"
         )
 
-        return found[:TARGET]
+        return found if TARGET <= 0 else found[:TARGET]
 
     except Exception as e:
 
@@ -212,6 +212,54 @@ def load_symbols():
 # ============================================================
 
 SYMBOLS = load_symbols()
+
+# Sembol listesini çalışma sırasında da yenileyebilmek için kilit.
+symbols_lock = threading.Lock()
+
+
+def refresh_symbols_from_file():
+    """
+    yalcin_pro_active_symbols.json dosyasını tekrar okur.
+    Böylece dosya sonradan güncellenirse sunucu yeniden başlatılmadan
+    yeni hisseler sisteme alınabilir.
+    """
+    global SYMBOLS
+
+    new_symbols = load_symbols()
+
+    if not new_symbols:
+        return False
+
+    with symbols_lock:
+        old_set = set(SYMBOLS)
+        new_set = set(new_symbols)
+
+        added = sorted(new_set - old_set)
+        removed = sorted(old_set - new_set)
+
+        if added or removed:
+            SYMBOLS = new_symbols
+
+            print(
+                f"YALCIN PRO - SEMBOL LISTESI GUNCELLENDI | "
+                f"ESKI={len(old_set)} | YENI={len(new_set)}"
+            )
+
+            if added:
+                print(
+                    "YALCIN PRO - YENI HISSELER: "
+                    + ", ".join(added)
+                )
+
+            if removed:
+                print(
+                    "YALCIN PRO - CIKAN HISSeler: "
+                    + ", ".join(removed)
+                )
+
+            return True
+
+    return False
 
 
 # ============================================================
@@ -936,6 +984,13 @@ def background_loop():
         try:
 
             # ------------------------------------------------
+            # SEMBOL LISTESINI KONTROL ET
+            # ------------------------------------------------
+            # JSON dosyasına yeni bir hisse eklenmişse sunucu
+            # yeniden başlatılmadan listeye alınır.
+            refresh_symbols_from_file()
+
+            # ------------------------------------------------
             # Ilk calismada hemen veri al
             # ------------------------------------------------
 
@@ -1001,6 +1056,8 @@ def home():
 @app.route("/health")
 def health():
 
+    refresh_symbols_from_file()
+
     return jsonify({
 
         "success": True,
@@ -1025,6 +1082,8 @@ def health():
 
 @app.route("/stats")
 def stats():
+
+    refresh_symbols_from_file()
 
     return jsonify({
 
@@ -1052,6 +1111,8 @@ def stats():
 @app.route("/symbols")
 def symbols():
 
+    refresh_symbols_from_file()
+
     return jsonify({
 
         "success": True,
@@ -1068,6 +1129,9 @@ def symbols():
 
 @app.route("/all")
 def all_stocks():
+
+    # Önce sembol listesini güncelle.
+    refresh_symbols_from_file()
 
     # --------------------------------------------------------
     # ONEMLI DUZELTME
