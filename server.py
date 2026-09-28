@@ -409,47 +409,66 @@ def fetch_one(symbol):
 
 
             if previous is not None:
+
                 previous = float(previous)
 
-            # ------------------------------------------------
-            # DUNYH OZEL KONTROL
-            # ------------------------------------------------
-            # Yahoo bazen DUNYH icin current price ile
-            # uyumsuz previousClose dondurebiliyor.
-            # Sadece DUNYH icin chart kapanis degerini
-            # kontrol ediyoruz. Diger hisselere dokunulmaz.
-            # ------------------------------------------------
 
-            if symbol == "DUNYH" and len(closes) >= 2:
+            # ====================================================
+            # DUNYH OZEL DUZELTME
+            # ====================================================
+            # Yahoo meta alaninda DUNYH icin 109.10 gibi
+            # uyumsuz bir previousClose gelebiliyor.
+            #
+            # SADECE DUNYH icin meta previousClose'u kullanmiyoruz.
+            # Chart verisindeki son tamamlanmis gunun kapanisini
+            # referans aliyoruz.
+            #
+            # Diger 613 hissenin hesaplamasi aynen korunuyor.
+            # ====================================================
 
-                chart_previous = closes[-2]
+            if symbol == "DUNYH":
 
-                if (
-                    chart_previous is not None
-                    and chart_previous > 0
-                ):
-                    chart_previous = float(chart_previous)
+                print(
+                    f"YALCIN PRO - DUNYH RAW | "
+                    f"PRICE={price} | "
+                    f"META_PREVIOUS={previous} | "
+                    f"CHART_CLOSINGS={closes}"
+                )
 
-                    # Meta previousClose ile chart kapanisi
-                    # arasinda %20'den fazla fark varsa
-                    # Yahoo meta degerini kullanma.
+                if len(closes) >= 2:
+
+                    # 5d/1d chart verisinde son eleman mevcut
+                    # gunun verisi olabilir. Bu nedenle bir onceki
+                    # kapanisi referans olarak aliyoruz.
+                    dunyh_previous = closes[-2]
+
                     if (
-                        previous is None
-                        or abs(previous - chart_previous)
-                        / chart_previous > 0.20
+                        dunyh_previous is not None
+                        and dunyh_previous > 0
                     ):
+
+                        previous = float(dunyh_previous)
+
                         print(
-                            f"YALCIN PRO - DUNYH OZEL DUZELTME | "
-                            f"YAHOO previousClose={previous} | "
-                            f"CHART previousClose={chart_previous}"
+                            f"YALCIN PRO - DUNYH DUZELTILDI | "
+                            f"PRICE={price} | "
+                            f"PREVIOUS={previous}"
                         )
-                        previous = chart_previous
+
+                    else:
+
+                        print(
+                            "YALCIN PRO - DUNYH | "
+                            "GECERLI CHART KAPANISI BULUNAMADI"
+                        )
+
 
             # ------------------------------------------------
             # DEGISIM YUZDESI
             # ------------------------------------------------
 
             change = None
+
 
             if previous not in (
                 None,
@@ -460,6 +479,7 @@ def fetch_one(symbol):
                     (price - previous)
                     / previous
                 ) * 100.0
+
 
             # ------------------------------------------------
             # LOG
