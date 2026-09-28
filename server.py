@@ -457,8 +457,10 @@ def refresh_symbols_from_online_source(force=False):
     ):
         return False
 
-    online = fetch_online_symbols()
+    # Aynı anda ikinci pahalı sembol taramasını engelle.
     last_symbol_source_check = now
+
+    online = fetch_online_symbols()
 
     if not online:
         return False
@@ -1417,7 +1419,7 @@ def stats():
 @app.route("/symbols")
 def symbols():
 
-    refresh_symbols_from_online_source()
+    # Online sembol taraması HTTP isteğinde çalıştırılmaz.
     refresh_symbols_from_file()
 
     return jsonify({
@@ -1437,11 +1439,8 @@ def symbols():
 @app.route("/all")
 def all_stocks():
 
-    # Önce online BIST sembol listesini kontrol et.
-    refresh_symbols_from_online_source()
-    refresh_symbols_from_file()
-
-    # Önce sembol listesini güncelle.
+    # /all isteği içinde pahalı online sembol taraması yapma.
+    # Sembol güncellemesi arka planda yapılır.
     refresh_symbols_from_file()
 
     # --------------------------------------------------------
@@ -1499,9 +1498,20 @@ def all_stocks():
         )
 
 
-        refresh_all(
-            force=True
-        )
+        def _background_refresh():
+            try:
+                refresh_all(force=True)
+            except Exception as e:
+                print(
+                    "YALCIN PRO - /all ARKA PLAN REFRESH HATASI:",
+                    repr(e)
+                )
+
+        threading.Thread(
+            target=_background_refresh,
+            daemon=True,
+            name="yalcinpro-all-refresh"
+        ).start()
 
 
     # --------------------------------------------------------
@@ -1751,6 +1761,8 @@ if __name__ == "__main__":
         ""
     )
 
+
+    print("YALCIN PRO - SERVER BASLATILIYOR | /all BLOKE ETMEZ")
 
     app.run(
 
