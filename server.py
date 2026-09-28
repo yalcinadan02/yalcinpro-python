@@ -225,19 +225,83 @@ def load_symbols():
 
 
 # ============================================================
+# GERCEK BIST HISSE FILTRESI
+# ============================================================
+
+def is_real_bist_equity(symbol):
+    """
+    Yahoo Finance tarafinda sembolun gercek bir sirket hissesi
+    (EQUITY) olup olmadigini kontrol eder.
+    """
+    try:
+        r = session.get(
+            YAHOO_URL.format(symbol),
+            params={
+                "range": "1d",
+                "interval": "1d",
+            },
+            timeout=10,
+        )
+
+        if r.status_code != 200:
+            return False
+
+        payload = r.json()
+
+        result = (
+            payload
+            .get("chart", {})
+            .get("result", [])
+        )
+
+        if not result:
+            return False
+
+        meta = result[0].get("meta", {})
+
+        instrument_type = str(
+            meta.get("instrumentType", "")
+        ).upper()
+
+        return instrument_type == "EQUITY"
+
+    except Exception:
+        return False
+
+
+def filter_real_bist_equities(symbols):
+    """
+    Sadece Yahoo Finance tarafinda EQUITY olarak tanimlanan
+    sembolleri kabul eder.
+    """
+    valid = []
+
+    for symbol in symbols:
+        if is_real_bist_equity(symbol):
+            valid.append(symbol)
+        else:
+            print(
+                f"YALCIN PRO - HISSE DEGIL, ATLANDI: {symbol}"
+            )
+
+    print(
+        f"YALCIN PRO - GERCEK HISSE SAYISI: {len(valid)}"
+    )
+
+    return valid
+
+
+# ============================================================
 # SEMBOL LISTESI
 # ============================================================
 
 SYMBOLS = load_symbols()
 
-# Daha önce eklenmiş semboller arasından da şirket hissesi olmayanları temizle.
-try:
-    SYMBOLS = filter_real_bist_equities(SYMBOLS)
-except Exception as e:
-    print(
-        "YALCIN PRO - ILK SEMBOL FILTRELEME HATASI:",
-        repr(e)
-    )
+# Daha once JSON'a eklenmis endeks/fon vb. sembolleri de temizle.
+SYMBOLS = filter_real_bist_equities(SYMBOLS)
+
+# Sembol listesi calisma sirasinda guvenli sekilde guncellenebilsin.
+symbols_lock = threading.Lock()
 
 # Sembol listesi çalışma sırasında güvenli şekilde güncellenebilsin.
 symbols_lock = threading.Lock()
