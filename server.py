@@ -230,8 +230,78 @@ def load_symbols():
 
 SYMBOLS = load_symbols()
 
+# Daha önce eklenmiş semboller arasından da şirket hissesi olmayanları temizle.
+try:
+    SYMBOLS = filter_real_bist_equities(SYMBOLS)
+except Exception as e:
+    print(
+        "YALCIN PRO - ILK SEMBOL FILTRELEME HATASI:",
+        repr(e)
+    )
+
 # Sembol listesi çalışma sırasında güvenli şekilde güncellenebilsin.
 symbols_lock = threading.Lock()
+
+
+def is_real_bist_equity(symbol):
+    """
+    Sembolün Yahoo Finance tarafında gerçek bir şirket hissesi (EQUITY)
+    olup olmadığını kontrol eder.
+    Endeks, ETF, emtia, döviz vb. ürünleri listeye almaz.
+    """
+    try:
+        r = session.get(
+            YAHOO_URL.format(symbol),
+            params={
+                "range": "1d",
+                "interval": "1d",
+            },
+            timeout=10
+        )
+
+        if r.status_code != 200:
+            return False
+
+        payload = r.json()
+        result = (
+            payload
+            .get("chart", {})
+            .get("result", [])
+        )
+
+        if not result:
+            return False
+
+        meta = result[0].get("meta", {})
+        quote_type = str(
+            meta.get("instrumentType", "")
+        ).upper()
+
+        return quote_type == "EQUITY"
+
+    except Exception:
+        return False
+
+
+def filter_real_bist_equities(symbols):
+    """
+    Online kaynaktan gelen sembolleri gerçek şirket hisseleriyle sınırlar.
+    """
+    valid = []
+
+    for symbol in symbols:
+        if is_real_bist_equity(symbol):
+            valid.append(symbol)
+        else:
+            print(
+                f"YALCIN PRO - HISSE DEGIL, ATLANDI: {symbol}"
+            )
+
+    print(
+        f"YALCIN PRO - GERCEK HISSE SAYISI: {len(valid)}"
+    )
+
+    return valid
 
 
 def fetch_online_symbols():
@@ -290,8 +360,11 @@ def fetch_online_symbols():
                     break
 
         print(
-            f"YALCIN PRO - ONLINE SEMBOL KAYNAGI: {len(found)} HISSE"
+            f"YALCIN PRO - ONLINE SEMBOL KAYNAGI: {len(found)} SEMBOL"
         )
+
+        # Sadece gerçek şirket hisselerini bırak.
+        found = filter_real_bist_equities(found)
 
         return found
 
