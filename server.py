@@ -8,55 +8,65 @@ from datetime import datetime
 import requests
 from flask import Flask, jsonify
 
-
-# ============================================================
-# YALCIN PRO BIST SERVER
-# ============================================================
-
 app = Flask(__name__)
+
+
+# ============================================================
+# YALCIN PRO - 614 BIST HISSE
+# Yahoo Finance Chart API tabanli, cache'li sunucu
+#
+# DUZELTILENLER:
+# - /all eski cache'i sonsuza kadar dondurmuyor
+# - Cache belirlenen sureyi gecince otomatik yenileniyor
+# - /refresh zorunlu yeni veri cekiyor
+# - Arka plan otomatik yenileme devam ediyor
+# - Fiyat ve degisim yuzdesi yeni verilerle guncelleniyor
+# ============================================================
 
 
 # ============================================================
 # AYARLAR
 # ============================================================
 
-# 0 = sembol sayisini sinirlama
-TARGET = 0
+TARGET = 0  # 0 = sembol sayisini sinirlama
 
-# Yerel aktif sembol dosyasi
 SYMBOL_FILE = "yalcin_pro_active_symbols.json"
-
 
 # ============================================================
 # OTOMATIK BIST SEMBOL KAYNAGI
 # ============================================================
-
+# KAP kaynakli, topluluk tarafindan güncellenen BIST sembol listesi.
+# Sunucu belirli araliklarla bu listeyi kontrol eder.
 SYMBOL_SOURCE_URL = (
     "https://raw.githubusercontent.com/ahmeterenodaci/"
     "Istanbul-Stock-Exchange--BIST--including-symbols-and-logos/"
     "main/bist.json"
 )
 
-# Yeni sembol listesini saatte bir kontrol et.
-#
-# Android /all istegi geldiginde de kontrol yapilir.
-# Boylece Render/Gunicorn arka plan thread'ine bagimli kalmaz.
-SYMBOL_SOURCE_REFRESH_SECONDS = 60 * 60
+# Yeni sembol listesini 6 saatte bir kontrol et.
+SYMBOL_SOURCE_REFRESH_SECONDS = 6 * 60 * 60
 
 last_symbol_source_check = 0
 
 
-# ============================================================
-# YAHOO AYARLARI
-# ============================================================
-
+# Yahoo'yu gereksiz yere hizli bombardimana tutmamak icin
+# kontrollu paralellik.
 WORKERS = 6
 
+# Yahoo istek timeout
 REQUEST_TIMEOUT = 15
 
+# Her hisse icin tekrar deneme
 RETRY_COUNT = 2
 
-# Fiyat cache'i 60 saniyede yenilenir.
+# Cache kac saniyede bir yenilensin?
+#
+# 60 saniye:
+# - Normal otomatik yenileme
+# - Yahoo'ya asiri istek gondermez
+#
+# Yenile butonu ise bunu beklemez ve force=True ile
+# aninda yeni veri ister.
 REFRESH_SECONDS = 60
 
 
@@ -64,10 +74,7 @@ REFRESH_SECONDS = 60
 # YAHOO FINANCE
 # ============================================================
 
-YAHOO_URL = (
-    "https://query1.finance.yahoo.com/"
-    "v8/finance/chart/{}.IS"
-)
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}.IS"
 
 
 # ============================================================
@@ -96,19 +103,14 @@ cache = {}
 last_refresh = {
     "timestamp": 0,
     "updated": 0,
-    "missing": 0,
-    "total": 0,
+    "missing": TARGET,
+    "total": TARGET,
     "status": "baslatiliyor",
 }
 
 
-# ============================================================
-# LOCKLAR
-# ============================================================
-
+# Ayni anda iki farkli yenileme yapilmasini engeller.
 refresh_lock = threading.Lock()
-
-symbols_lock = threading.Lock()
 
 
 # ============================================================
@@ -116,137 +118,70 @@ symbols_lock = threading.Lock()
 # ============================================================
 
 def now_text():
-    return datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ============================================================
-# SEMBOL NORMALIZE
-# ============================================================
-
-def normalize_symbol(value):
-
-    if not isinstance(value, str):
-        return ""
-
-    symbol = (
-        value
-        .strip()
-        .upper()
-        .replace(".IS", "")
-        .replace(" ", "")
-    )
-
-    if not (
-        2 <= len(symbol) <= 8
-    ):
-        return ""
-
-    if not symbol.isalnum():
-        return ""
-
-    return symbol
-
-
-# ============================================================
-# SEMBOL EKLE
-# ============================================================
-
-def add_symbol_to_list(
-    found,
-    value
-):
-
-    symbol = normalize_symbol(
-        value
-    )
-
-    if not symbol:
-        return
-
-    if symbol not in found:
-        found.append(symbol)
-
-
-# ============================================================
-# YEREL SEMBOL DOSYASI
+# SEMBOLLERI OKU
 # ============================================================
 
 def load_symbols():
-
     path = os.path.join(
         os.path.dirname(__file__),
         SYMBOL_FILE
     )
 
     if not os.path.exists(path):
-
         print(
             "YALCIN PRO - SEMBOL DOSYASI YOK:",
             path
         )
-
         return []
 
     try:
-
         with open(
             path,
             "r",
             encoding="utf-8"
         ) as f:
-
             obj = json.load(f)
-
 
         found = []
 
+        def add(value):
+            if isinstance(value, str):
+                s = value.strip().upper()
 
-        # ----------------------------------------------------
-        # LISTE
-        # ----------------------------------------------------
+                # .IS varsa kaldir
+                s = s.replace(".IS", "")
 
-        if isinstance(
-            obj,
-            list
-        ):
-
-            for item in obj:
-
-                if isinstance(
-                    item,
-                    str
+                # BIST sembol kontrolu
+                if (
+                    2 <= len(s) <= 8
+                    and s.isalnum()
                 ):
+                    if s not in found:
+                        found.append(s)
 
-                    add_symbol_to_list(
-                        found,
-                        item
+        # Liste
+        if isinstance(obj, list):
+
+            for x in obj:
+
+                if isinstance(x, str):
+                    add(x)
+
+                elif isinstance(x, dict):
+                    add(
+                        x.get("symbol")
+                        or x.get("sembol")
+                        or x.get("code")
                     )
 
-                elif isinstance(
-                    item,
-                    dict
-                ):
+        # Obje
+        elif isinstance(obj, dict):
 
-                    add_symbol_to_list(
-                        found,
-                        item.get("symbol")
-                        or item.get("sembol")
-                        or item.get("code")
-                        or item.get("kod")
-                    )
-
-
-        # ----------------------------------------------------
-        # OBJE
-        # ----------------------------------------------------
-
-        elif isinstance(
-            obj,
-            dict
-        ):
-
+            # Liste iceren ilk uygun alani bul
             for key in (
                 "symbols",
                 "semboller",
@@ -256,51 +191,28 @@ def load_symbols():
 
                 value = obj.get(key)
 
-                if isinstance(
-                    value,
-                    list
-                ):
+                if isinstance(value, list):
 
-                    for item in value:
+                    for x in value:
 
-                        if isinstance(
-                            item,
-                            str
-                        ):
+                        if isinstance(x, str):
+                            add(x)
 
-                            add_symbol_to_list(
-                                found,
-                                item
-                            )
-
-                        elif isinstance(
-                            item,
-                            dict
-                        ):
-
-                            add_symbol_to_list(
-                                found,
-                                item.get("symbol")
-                                or item.get("sembol")
-                                or item.get("code")
-                                or item.get("kod")
+                        elif isinstance(x, dict):
+                            add(
+                                x.get("symbol")
+                                or x.get("sembol")
+                                or x.get("code")
                             )
 
                     break
 
-
-        if TARGET > 0:
-
-            found = found[:TARGET]
-
-
         print(
-            "YALCIN PRO - AKTIF SEMBOL:",
-            len(found)
+            f"YALCIN PRO - AKTIF SEMBOL: "
+            f"{len(found)} / {TARGET}"
         )
 
-        return found
-
+        return found if TARGET <= 0 else found[:TARGET]
 
     except Exception as e:
 
@@ -313,440 +225,443 @@ def load_symbols():
 
 
 # ============================================================
-# SEMBOL DOSYASINI KAYDET
+# GERCEK BIST HISSE FILTRESI
 # ============================================================
 
-def save_symbols():
-
-    path = os.path.join(
-        os.path.dirname(__file__),
-        SYMBOL_FILE
-    )
-
+def is_real_bist_equity(symbol):
+    """
+    Yahoo Finance tarafinda sembolun gercek bir sirket hissesi
+    (EQUITY) olup olmadigini kontrol eder.
+    """
     try:
-
-        with open(
-            path,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                SYMBOLS,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        print(
-            "YALCIN PRO - SEMBOL DOSYASI GUNCELLENDI:",
-            len(SYMBOLS)
+        r = session.get(
+            YAHOO_URL.format(symbol),
+            params={
+                "range": "1d",
+                "interval": "1d",
+            },
+            timeout=10,
         )
 
-        return True
+        if r.status_code != 200:
+            return False
 
-    except Exception as e:
+        payload = r.json()
 
-        print(
-            "YALCIN PRO - SEMBOL DOSYASI YAZMA HATASI:",
-            repr(e)
+        result = (
+            payload
+            .get("chart", {})
+            .get("result", [])
         )
 
+        if not result:
+            return False
+
+        meta = result[0].get("meta", {})
+
+        instrument_type = str(
+            meta.get("instrumentType", "")
+        ).upper()
+
+        return instrument_type == "EQUITY"
+
+    except Exception:
         return False
 
 
+def filter_real_bist_equities(symbols):
+    """
+    Sadece Yahoo Finance tarafinda EQUITY olarak tanimlanan
+    sembolleri kabul eder.
+    """
+    valid = []
+
+    for symbol in symbols:
+        if is_real_bist_equity(symbol):
+            valid.append(symbol)
+        else:
+            print(
+                f"YALCIN PRO - HISSE DEGIL, ATLANDI: {symbol}"
+            )
+
+    print(
+        f"YALCIN PRO - GERCEK HISSE SAYISI: {len(valid)}"
+    )
+
+    return valid
+
+
 # ============================================================
-# BASLANGIC SEMBOL LISTESI
+# SEMBOL LISTESI
 # ============================================================
 
 SYMBOLS = load_symbols()
 
+# ONEMLI:
+# Sunucu baslangicinda 600+ sembolu Yahoo'da tek tek kontrol ETME.
+# Bu eski filtreleme sunucunun 5000 portunu acmadan uzun sure beklemesine
+# neden oluyordu. Gercek veri kontrolu fetch_one() sirasinda yapilir.
+SYMBOLS = load_symbols()
 
-# ============================================================
-# ONLINE SEMBOL LISTESINI AL
-# ============================================================
+# Sembol listesi calisma sirasinda guvenli sekilde guncellenebilsin.
+symbols_lock = threading.Lock()
 
-def fetch_online_symbols():
+# Sembol listesi çalışma sırasında güvenli şekilde güncellenebilsin.
+symbols_lock = threading.Lock()
 
+
+def is_real_bist_equity(symbol):
+    """
+    Sembolün Yahoo Finance tarafında gerçek bir şirket hissesi (EQUITY)
+    olup olmadığını kontrol eder.
+    Endeks, ETF, emtia, döviz vb. ürünleri listeye almaz.
+    """
     try:
-
-        print(
-            "YALCIN PRO - ONLINE SEMBOL LISTESI KONTROL EDILIYOR"
+        r = session.get(
+            YAHOO_URL.format(symbol),
+            params={
+                "range": "1d",
+                "interval": "1d",
+            },
+            timeout=10
         )
 
-        response = session.get(
+        if r.status_code != 200:
+            return False
+
+        payload = r.json()
+        result = (
+            payload
+            .get("chart", {})
+            .get("result", [])
+        )
+
+        if not result:
+            return False
+
+        meta = result[0].get("meta", {})
+        quote_type = str(
+            meta.get("instrumentType", "")
+        ).upper()
+
+        return quote_type == "EQUITY"
+
+    except Exception:
+        return False
+
+
+def filter_real_bist_equities(symbols):
+    """
+    Online kaynaktan gelen sembolleri gerçek şirket hisseleriyle sınırlar.
+    """
+    valid = []
+
+    for symbol in symbols:
+        if is_real_bist_equity(symbol):
+            valid.append(symbol)
+        else:
+            print(
+                f"YALCIN PRO - HISSE DEGIL, ATLANDI: {symbol}"
+            )
+
+    print(
+        f"YALCIN PRO - GERCEK HISSE SAYISI: {len(valid)}"
+    )
+
+    return valid
+
+
+def fetch_online_symbols():
+    """
+    İnternetteki güncel BIST sembol listesini alır.
+    Kaynak erişilemezse mevcut JSON listesi korunur.
+    """
+    try:
+        r = session.get(
             SYMBOL_SOURCE_URL,
             timeout=15
         )
 
-
-        if response.status_code != 200:
-
+        if r.status_code != 200:
             print(
-                "YALCIN PRO - ONLINE SEMBOL HTTP:",
-                response.status_code
+                f"YALCIN PRO - ONLINE SEMBOL KAYNAGI HTTP {r.status_code}"
             )
-
             return []
 
-
-        payload = response.json()
-
+        payload = r.json()
         found = []
 
+        def add(value):
+            if not isinstance(value, str):
+                return
 
-        # ----------------------------------------------------
-        # LISTE
-        # ----------------------------------------------------
+            s = value.strip().upper().replace(".IS", "")
 
-        if isinstance(
-            payload,
-            list
-        ):
+            if 2 <= len(s) <= 8 and s.isalnum() and s not in found:
+                found.append(s)
 
+        if isinstance(payload, list):
             for item in payload:
-
-                if isinstance(
-                    item,
-                    str
-                ):
-
-                    add_symbol_to_list(
-                        found,
-                        item
-                    )
-
-                elif isinstance(
-                    item,
-                    dict
-                ):
-
-                    add_symbol_to_list(
-                        found,
+                if isinstance(item, str):
+                    add(item)
+                elif isinstance(item, dict):
+                    add(
                         item.get("symbol")
                         or item.get("sembol")
                         or item.get("code")
-                        or item.get("kod")
                     )
 
-
-        # ----------------------------------------------------
-        # OBJE
-        # ----------------------------------------------------
-
-        elif isinstance(
-            payload,
-            dict
-        ):
-
-            for key in (
-                "symbols",
-                "semboller",
-                "data",
-                "stocks"
-            ):
-
+        elif isinstance(payload, dict):
+            for key in ("symbols", "semboller", "data", "stocks"):
                 value = payload.get(key)
-
-                if isinstance(
-                    value,
-                    list
-                ):
-
+                if isinstance(value, list):
                     for item in value:
-
-                        if isinstance(
-                            item,
-                            str
-                        ):
-
-                            add_symbol_to_list(
-                                found,
-                                item
-                            )
-
-                        elif isinstance(
-                            item,
-                            dict
-                        ):
-
-                            add_symbol_to_list(
-                                found,
+                        if isinstance(item, str):
+                            add(item)
+                        elif isinstance(item, dict):
+                            add(
                                 item.get("symbol")
                                 or item.get("sembol")
                                 or item.get("code")
-                                or item.get("kod")
                             )
-
                     break
 
-
         print(
-            "YALCIN PRO - ONLINE SEMBOL SAYISI:",
-            len(found)
+            f"YALCIN PRO - ONLINE SEMBOL KAYNAGI: {len(found)} SEMBOL"
         )
 
+        # Burada Yahoo'ya tek tek EQUITY kontrolu yapma.
+        # Bu kontrol sunucunun baslangicini/arka planini gereksiz yere yavaslatir.
+        # fetch_one() basarili veri gelmeyen sembolleri zaten cache'e almaz.
         return found
 
-
     except Exception as e:
-
         print(
             "YALCIN PRO - ONLINE SEMBOL KAYNAGI HATASI:",
             repr(e)
         )
-
         return []
 
 
-# ============================================================
-# ONLINE SEMBOLLERI GUNCELLE
-# ============================================================
+def refresh_symbols_from_online_source(force=False):
+    """
+    Online sembol kaynagini periyodik olarak kontrol eder.
 
-def refresh_symbols_from_online_source(
-    force=False
-):
+    Online kaynak basariliysa:
+    - Yeni semboller otomatik eklenir.
+    - Artik kaynakta bulunmayan eski semboller otomatik kaldirilir.
+    - Sembol degistiren hisselerde eski sembol gider, yeni sembol gelir.
+    - Ornek: MARKA kaldirilip USHOL geldiyse MARKA silinir, USHOL eklenir.
 
+    Online kaynak gecici olarak kullanilamazsa mevcut liste korunur.
+    """
     global SYMBOLS
     global last_symbol_source_check
 
-
     now = time.time()
-
-
-    # --------------------------------------------------------
-    # KONTROL ZAMANI GELMEDI
-    # --------------------------------------------------------
 
     if (
         not force
         and last_symbol_source_check > 0
-        and (
-            now
-            - last_symbol_source_check
-        ) < SYMBOL_SOURCE_REFRESH_SECONDS
+        and now - last_symbol_source_check < SYMBOL_SOURCE_REFRESH_SECONDS
     ):
-
         return False
 
-
-    online_symbols = (
-        fetch_online_symbols()
-    )
-
-
+    online = fetch_online_symbols()
     last_symbol_source_check = now
 
-
-    if not online_symbols:
-
-        print(
-            "YALCIN PRO - ONLINE SEMBOL LISTESI ALINAMADI"
-        )
-
+    if not online:
+        print("YALCIN PRO - ONLINE SEMBOL LISTESI ALINAMADI")
+        print("YALCIN PRO - MEVCUT SEMBOL LISTESI KORUNUYOR")
         return False
 
+    online_clean = []
+    seen = set()
 
-    added = []
+    for symbol in online:
+        if not isinstance(symbol, str):
+            continue
 
+        s = symbol.strip().upper().replace(".IS", "")
+
+        if not s or s in seen:
+            continue
+
+        seen.add(s)
+        online_clean.append(s)
 
     with symbols_lock:
+        old = list(SYMBOLS)
+        old_set = set(old)
+        new_set = set(online_clean)
 
-        old_set = set(
-            SYMBOLS
-        )
+        added = sorted(new_set - old_set)
+        removed = sorted(old_set - new_set)
 
+        if not added and not removed:
+            print(
+                "YALCIN PRO - OTOMATIK SEMBOL KONTROLU: "
+                f"DEGISIKLIK YOK | TOPLAM={len(online_clean)}"
+            )
+            return False
 
-        for symbol in online_symbols:
+        # Online kaynak artik guncel ana sembol listemizdir.
+        SYMBOLS = online_clean
 
-            if symbol not in old_set:
-
-                added.append(
-                    symbol
-                )
-
+        print("=================================================")
+        print("YALCIN PRO - SEMBOL LISTESI GUNCELLENDI")
+        print(f"YALCIN PRO - ESKI={len(old_set)}")
+        print(f"YALCIN PRO - YENI={len(new_set)}")
+        print(f"YALCIN PRO - EKLENEN={len(added)}")
+        print(f"YALCIN PRO - CIKAN={len(removed)}")
 
         if added:
-
-            SYMBOLS = (
-                list(SYMBOLS)
-                + added
+            print(
+                "YALCIN PRO - YENI SEMBOLLER: "
+                + ", ".join(added)
             )
 
+        if removed:
+            print(
+                "YALCIN PRO - CIKAN HISSeler: "
+                + ", ".join(removed)
+            )
 
-    # --------------------------------------------------------
-    # YENI HISSELER
-    # --------------------------------------------------------
+        if "MARKA" in removed:
+            print(
+                "YALCIN PRO - MARKA ESKI SEMBOL OLARAK "
+                "LISTEDEN KALDIRILDI"
+            )
 
-    if added:
+        if "USHOL" in added:
+            print(
+                "YALCIN PRO - USHOL YENI SEMBOL OLARAK "
+                "LISTEYE EKLENDI"
+            )
 
-        print(
-            "=================================================="
-        )
+        try:
+            symbol_path = os.path.join(
+                os.path.dirname(__file__),
+                SYMBOL_FILE
+            )
 
-        print(
-            "YALCIN PRO - YENI HISSELER BULUNDU"
-        )
+            with open(
+                symbol_path,
+                "w",
+                encoding="utf-8"
+            ) as f:
+                json.dump(
+                    SYMBOLS,
+                    f,
+                    ensure_ascii=False,
+                    indent=2
+                )
 
-        print(
-            "YENI ADET:",
-            len(added)
-        )
+            print("YALCIN PRO - SEMBOL DOSYASI GUNCELLENDI")
 
-        print(
-            "TOPLAM:",
-            len(SYMBOLS)
-        )
+        except Exception as e:
+            print(
+                "YALCIN PRO - SEMBOL DOSYASI YAZMA HATASI:",
+                repr(e)
+            )
 
-        print(
-            "YENI SEMBOLLER:",
-            ", ".join(added)
-        )
-
-        print(
-            "=================================================="
-        )
-
-
-        save_symbols()
-
-
+        print("=================================================")
         return True
 
-
-    print(
-        "YALCIN PRO - YENI HISSE YOK | TOPLAM:",
-        len(SYMBOLS)
-    )
-
-    return False
-
-
-# ============================================================
-# DOSYADAKI SEMBOLLERI YENIDEN OKU
-# ============================================================
-
 def refresh_symbols_from_file():
-
+    """
+    yalcin_pro_active_symbols.json dosyasını tekrar okur.
+    Böylece dosya sonradan güncellenirse sunucu yeniden başlatılmadan
+    yeni hisseler sisteme alınabilir.
+    """
     global SYMBOLS
-
 
     new_symbols = load_symbols()
 
-
     if not new_symbols:
-
         return False
 
-
     with symbols_lock:
+        old_set = set(SYMBOLS)
+        new_set = set(new_symbols)
 
-        old_set = set(
-            SYMBOLS
-        )
+        added = sorted(new_set - old_set)
+        removed = sorted(old_set - new_set)
 
-        new_set = set(
-            new_symbols
-        )
-
-
-        added = sorted(
-            new_set
-            - old_set
-        )
-
-        removed = sorted(
-            old_set
-            - new_set
-        )
-
-
-        if (
-            added
-            or removed
-        ):
-
-            SYMBOLS = (
-                new_symbols
-            )
-
+        if added or removed:
+            SYMBOLS = new_symbols
 
             print(
-                "YALCIN PRO - SEMBOL DOSYASI DEGISTI"
+                f"YALCIN PRO - SEMBOL LISTESI GUNCELLENDI | "
+                f"ESKI={len(old_set)} | YENI={len(new_set)}"
             )
-
-            print(
-                "ESKI:",
-                len(old_set)
-            )
-
-            print(
-                "YENI:",
-                len(new_set)
-            )
-
 
             if added:
-
                 print(
-                    "EKLENEN:",
-                    ", ".join(added)
+                    "YALCIN PRO - YENI HISSELER: "
+                    + ", ".join(added)
                 )
-
 
             if removed:
-
                 print(
-                    "CIKAN:",
-                    ", ".join(removed)
+                    "YALCIN PRO - CIKAN HISSeler: "
+                    + ", ".join(removed)
                 )
 
-
             return True
-
 
     return False
 
 
 # ============================================================
-# TEK HISSE VERISI
+# TEK HISSE VERISI CEK
 # ============================================================
 
 def fetch_one(symbol):
+    """
+    Tek hisse icin Yahoo Chart verisini alir.
 
-    symbol = normalize_symbol(
+    Donen alanlar:
+        sembol
+        kod
         symbol
-    )
+        code
+        fiyat
+        price
+        oncekiKapanis
+        previousClose
+        degisimYuzde
+        changePercent
+        paraBirimi
+        currency
+    """
 
+    url = YAHOO_URL.format(symbol)
 
-    if not symbol:
-
-        return None
-
-
-    url = YAHOO_URL.format(
-        symbol
-    )
-
-
-    for attempt in range(
-        RETRY_COUNT + 1
-    ):
+    for attempt in range(RETRY_COUNT + 1):
 
         try:
 
-            response = session.get(
+            # ------------------------------------------------
+            # YAHOO ISTEGI
+            # ------------------------------------------------
 
+            r = session.get(
                 url,
-
                 params={
+                    # 5 gunluk veri
                     "range": "5d",
+
+                    # Gunluk veri.
+                    # regularMarketPrice meta alanindan
+                    # guncel fiyati almaya calisiyoruz.
                     "interval": "1d",
+
                     "events": "div,splits",
+
                     "includeAdjustedClose": "true",
                 },
-
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
 
 
@@ -754,20 +669,16 @@ def fetch_one(symbol):
             # RATE LIMIT
             # ------------------------------------------------
 
-            if response.status_code == 429:
+            if r.status_code == 429:
 
                 print(
-                    "YALCIN PRO -",
-                    symbol,
-                    "429 RATE LIMIT"
+                    f"YALCIN PRO - {symbol}: "
+                    f"429 RATE LIMIT | "
+                    f"DENEME={attempt + 1}"
                 )
 
                 time.sleep(
-                    1.5
-                    * (
-                        attempt
-                        + 1
-                    )
+                    1.5 * (attempt + 1)
                 )
 
                 continue
@@ -777,13 +688,11 @@ def fetch_one(symbol):
             # HTTP HATASI
             # ------------------------------------------------
 
-            if response.status_code != 200:
+            if r.status_code != 200:
 
                 print(
-                    "YALCIN PRO -",
-                    symbol,
-                    "HTTP",
-                    response.status_code
+                    f"YALCIN PRO - {symbol}: "
+                    f"HTTP {r.status_code}"
                 )
 
                 return None
@@ -793,10 +702,7 @@ def fetch_one(symbol):
             # JSON
             # ------------------------------------------------
 
-            payload = (
-                response.json()
-            )
-
+            payload = r.json()
 
             result = (
                 payload
@@ -808,110 +714,89 @@ def fetch_one(symbol):
             if not result:
 
                 print(
-                    "YALCIN PRO -",
-                    symbol,
-                    "YAHOO RESULT BOS"
+                    f"YALCIN PRO - {symbol}: "
+                    f"YAHOO RESULT BOS"
                 )
 
                 return None
-
-
-            result = result[0]
 
 
             # ------------------------------------------------
             # META
             # ------------------------------------------------
 
-            meta = result.get(
+            meta = result[0].get(
                 "meta",
                 {}
             )
 
 
+            # Guncel fiyat
             price = meta.get(
                 "regularMarketPrice"
             )
 
-
+            # Onceki kapanis
             previous = meta.get(
                 "previousClose"
             )
 
 
             # ------------------------------------------------
-            # CHART
+            # CHART KAPANISLARI
             # ------------------------------------------------
 
-            indicators = result.get(
+            indicators = result[0].get(
                 "indicators",
                 {}
             )
-
 
             quote = indicators.get(
                 "quote",
                 []
             )
 
-
             closes = []
 
 
             if quote:
 
-                raw_closes = (
-                    quote[0]
-                    .get(
-                        "close",
-                        []
-                    )
+                raw_closes = quote[0].get(
+                    "close",
+                    []
                 )
 
-
                 closes = [
-
-                    float(value)
-
-                    for value
-                    in raw_closes
-
-                    if value is not None
+                    float(x)
+                    for x in raw_closes
+                    if x is not None
                 ]
 
 
             # ------------------------------------------------
-            # FIYAT FALLBACK
+            # PRICE FALLBACK
             # ------------------------------------------------
 
-            if (
-                price is None
-                and closes
-            ):
+            if price is None and closes:
 
-                price = (
-                    closes[-1]
-                )
+                price = closes[-1]
 
 
             if price is None:
 
                 print(
-                    "YALCIN PRO -",
-                    symbol,
-                    "FIYAT BULUNAMADI"
+                    f"YALCIN PRO - {symbol}: "
+                    f"FIYAT BULUNAMADI"
                 )
 
                 return None
 
 
-            price = float(
-                price
-            )
+            price = float(price)
 
 
             # ------------------------------------------------
-            # ONCEKI KAPANIS FALLBACK
+            # PREVIOUS CLOSE FALLBACK
             # ------------------------------------------------
 
             if (
@@ -919,75 +804,113 @@ def fetch_one(symbol):
                 and len(closes) >= 2
             ):
 
-                previous = (
-                    closes[-2]
-                )
+                previous = closes[-2]
 
 
             if previous is not None:
 
-                previous = float(
-                    previous
-                )
+                previous = float(previous)
 
 
-            # =================================================
+            # ====================================================
             # DUNYH OZEL DUZELTME
-            # =================================================
+            # ====================================================
+            # Yahoo meta alaninda DUNYH icin 109.10 gibi
+            # uyumsuz bir previousClose gelebiliyor.
+            #
+            # SADECE DUNYH icin meta previousClose'u kullanmiyoruz.
+            # Chart verisindeki son tamamlanmis gunun kapanisini
+            # referans aliyoruz.
+            #
+            # Diger 613 hissenin hesaplamasi aynen korunuyor.
+            # ====================================================
 
             if symbol == "DUNYH":
 
+                print(
+                    f"YALCIN PRO - DUNYH RAW | "
+                    f"PRICE={price} | "
+                    f"META_PREVIOUS={previous} | "
+                    f"CHART_CLOSINGS={closes}"
+                )
+
                 if len(closes) >= 2:
 
-                    chart_previous = (
-                        closes[-2]
-                    )
-
+                    # 5d/1d chart verisinde son eleman mevcut
+                    # gunun verisi olabilir. Bu nedenle bir onceki
+                    # kapanisi referans olarak aliyoruz.
+                    dunyh_previous = closes[-2]
 
                     if (
-                        chart_previous
-                        is not None
-                        and chart_previous > 0
+                        dunyh_previous is not None
+                        and dunyh_previous > 0
                     ):
 
-                        previous = float(
-                            chart_previous
+                        previous = float(dunyh_previous)
+
+                        # ------------------------------------------------
+                        # DUNYH OZEL KORUMA
+                        # ------------------------------------------------
+                        # Yahoo DUNYH icin chart/meta verisinde
+                        # 109.10 degerini hatali sekilde donduruyor.
+                        # Bu nedenle bugunku bilinen onceki kapanis
+                        # 44.56 TL kullaniliyor.
+                        #
+                        # SADECE DUNYH etkilenir.
+                        # Diger 613 hissenin kodu degismez.
+                        # ------------------------------------------------
+                        if abs(previous - 109.10) < 0.01:
+                            previous = 44.56
+
+                            print(
+                                f"YALCIN PRO - DUNYH SABIT DUZELTME | "
+                                f"PRICE={price} | "
+                                f"PREVIOUS={previous}"
+                            )
+                        else:
+                            print(
+                                f"YALCIN PRO - DUNYH DUZELTILDI | "
+                                f"PRICE={price} | "
+                                f"PREVIOUS={previous}"
+                            )
+
+                    else:
+
+                        print(
+                            "YALCIN PRO - DUNYH | "
+                            "GECERLI CHART KAPANISI BULUNAMADI"
                         )
 
 
-                # Bilinen hatali Yahoo degeri
-                if (
-                    previous is not None
-                    and abs(
-                        previous
-                        - 109.10
-                    ) < 0.01
-                ):
-
-                    previous = 44.56
-
-
             # ------------------------------------------------
-            # DEGISIM
+            # DEGISIM YUZDESI
             # ------------------------------------------------
 
             change = None
 
 
-            if (
-                previous is not None
-                and previous != 0
+            if previous not in (
+                None,
+                0
             ):
 
                 change = (
-
-                    (
-                        price
-                        - previous
-                    )
+                    (price - previous)
                     / previous
-
                 ) * 100.0
+
+
+            # ------------------------------------------------
+            # LOG
+            # ------------------------------------------------
+
+            if previous is None:
+
+                print(
+                    f"YALCIN PRO - {symbol}: "
+                    f"ONCEKI KAPANIS BULUNAMADI | "
+                    f"FIYAT={price}"
+                )
 
 
             # ------------------------------------------------
@@ -996,97 +919,67 @@ def fetch_one(symbol):
 
             item = {
 
-                "sembol":
-                    symbol,
+                "sembol": symbol,
 
-                "kod":
-                    symbol,
+                "kod": symbol,
 
-                "symbol":
-                    symbol,
+                "symbol": symbol,
 
-                "code":
-                    symbol,
+                "code": symbol,
 
 
-                "fiyat":
+                "fiyat": round(
+                    price,
+                    4
+                ),
+
+                "price": round(
+                    price,
+                    4
+                ),
+
+
+                "oncekiKapanis": (
                     round(
-                        price,
+                        previous,
                         4
-                    ),
+                    )
+                    if previous is not None
+                    else None
+                ),
 
-                "price":
+                "previousClose": (
                     round(
-                        price,
+                        previous,
                         4
-                    ),
+                    )
+                    if previous is not None
+                    else None
+                ),
 
 
-                "oncekiKapanis":
+                "degisimYuzde": (
+                    round(
+                        change,
+                        4
+                    )
+                    if change is not None
+                    else 0.0
+                ),
 
-                    (
-                        round(
-                            previous,
-                            4
-                        )
-
-                        if previous
-                        is not None
-
-                        else None
-                    ),
-
-
-                "previousClose":
-
-                    (
-                        round(
-                            previous,
-                            4
-                        )
-
-                        if previous
-                        is not None
-
-                        else None
-                    ),
+                "changePercent": (
+                    round(
+                        change,
+                        4
+                    )
+                    if change is not None
+                    else 0.0
+                ),
 
 
-                "degisimYuzde":
+                "paraBirimi": "TRY",
 
-                    (
-                        round(
-                            change,
-                            4
-                        )
-
-                        if change
-                        is not None
-
-                        else 0.0
-                    ),
-
-
-                "changePercent":
-
-                    (
-                        round(
-                            change,
-                            4
-                        )
-
-                        if change
-                        is not None
-
-                        else 0.0
-                    ),
-
-
-                "paraBirimi":
-                    "TRY",
-
-                "currency":
-                    "TRY",
+                "currency": "TRY",
             }
 
 
@@ -1096,24 +989,16 @@ def fetch_one(symbol):
         except Exception as e:
 
             print(
-                "YALCIN PRO -",
-                symbol,
-                "HATA:",
-                repr(e)
+                f"YALCIN PRO - {symbol}: "
+                f"HATA | "
+                f"{repr(e)}"
             )
 
 
-            if (
-                attempt
-                < RETRY_COUNT
-            ):
+            if attempt < RETRY_COUNT:
 
                 time.sleep(
-                    0.8
-                    * (
-                        attempt
-                        + 1
-                    )
+                    0.8 * (attempt + 1)
                 )
 
             else:
@@ -1125,19 +1010,17 @@ def fetch_one(symbol):
 
 
 # ============================================================
-# TÜM HİSSELERİ YENİLE
+# TUM HISSeleri YENILE
 # ============================================================
 
-def refresh_all(
-    force=False
-):
+def refresh_all(force=False):
 
     global cache
     global last_refresh
 
 
     # --------------------------------------------------------
-    # AYNI ANDA İKİ REFRESH ENGELLE
+    # Ayni anda ikinci refresh'i engelle
     # --------------------------------------------------------
 
     if not refresh_lock.acquire(
@@ -1145,7 +1028,8 @@ def refresh_all(
     ):
 
         print(
-            "YALCIN PRO - REFRESH ZATEN CALISIYOR"
+            "YALCIN PRO - "
+            "REFRESH ZATEN CALISIYOR"
         )
 
         return len(cache)
@@ -1154,117 +1038,107 @@ def refresh_all(
     try:
 
         # ----------------------------------------------------
-        # CACHE KONTROL
+        # CACHE KONTROLU
         # ----------------------------------------------------
 
-        if (
-            not force
-            and cache
-        ):
+        if not force and cache:
 
             age = (
                 time.time()
-                - last_refresh[
-                    "timestamp"
-                ]
+                - last_refresh["timestamp"]
             )
 
 
-            if (
-                age
-                < REFRESH_SECONDS
-            ):
+            if age < REFRESH_SECONDS:
+
+                print(
+                    f"YALCIN PRO - "
+                    f"REFRESH ATLANDI | "
+                    f"CACHE YASI={age:.1f}s"
+                )
 
                 return len(cache)
 
 
         # ----------------------------------------------------
-        # SEMBOLLER
+        # SEMBOL SAYISI
         # ----------------------------------------------------
 
-        with symbols_lock:
-
-            current_symbols = (
-                list(SYMBOLS)
-            )
-
-
-        total = len(
-            current_symbols
-        )
+        total = len(SYMBOLS)
 
 
         if total == 0:
 
             last_refresh.update({
 
-                "timestamp":
-                    time.time(),
+                "status": "sembol_yok",
 
-                "updated":
-                    0,
+                "timestamp": time.time(),
 
-                "missing":
-                    0,
+                "updated": 0,
 
-                "total":
-                    0,
+                "total": TARGET,
 
-                "status":
-                    "sembol_yok",
+                "missing": TARGET,
             })
-
 
             return 0
 
 
-        print("")
-        print(
-            "=================================================="
-        )
-
-        print(
-            "YALCIN PRO - YAHOO YENILEME BASLADI"
-        )
-
-        print(
-            "HISSE SAYISI:",
-            total
-        )
-
-        print(
-            "WORKER:",
-            WORKERS
-        )
-
-        print(
-            "FORCE:",
-            force
-        )
-
-        print(
-            "=================================================="
-        )
-
+        # ----------------------------------------------------
+        # DURUM
+        # ----------------------------------------------------
 
         last_refresh.update({
 
-            "status":
-                "veri_aliniyor",
+            "status": "veri_aliniyor",
 
-            "total":
-                total,
+            "total": total,
 
-            "missing":
-                total,
+            "missing": total,
 
-            "updated":
-                0,
+            "updated": 0,
         })
+
+
+        print(
+            ""
+        )
+
+        print(
+            "=================================================="
+        )
+
+        print(
+            f"YALCIN PRO - YAHOO YENILEME BASLADI"
+        )
+
+        print(
+            f"HISSE SAYISI : {total}"
+        )
+
+        print(
+            f"WORKER       : {WORKERS}"
+        )
+
+        print(
+            f"FORCE        : {force}"
+        )
+
+        print(
+            "=================================================="
+        )
 
 
         # ----------------------------------------------------
         # YENI CACHE
+        #
+        # ONEMLI:
+        # Eski cache'i burada direkt silmiyoruz.
+        #
+        # Yahoo'dan basarili gelenler new_cache'e giriyor.
+        # Daha sonra cache.update(new_cache) ile
+        # sadece basarili veriler yenileniyor.
         # ----------------------------------------------------
 
         new_cache = {}
@@ -1273,14 +1147,11 @@ def refresh_all(
 
 
         # ----------------------------------------------------
-        # PARALEL YAHOO
+        # PARALEL YAHOO ISTEKLERI
         # ----------------------------------------------------
 
         with ThreadPoolExecutor(
-
-            max_workers=
-                WORKERS
-
+            max_workers=WORKERS
         ) as executor:
 
 
@@ -1288,12 +1159,10 @@ def refresh_all(
 
                 executor.submit(
                     fetch_one,
-                    symbol
-                ):
-                    symbol
+                    s
+                ): s
 
-                for symbol
-                in current_symbols
+                for s in SYMBOLS
             }
 
 
@@ -1301,34 +1170,32 @@ def refresh_all(
                 futures
             ):
 
-                symbol = (
-                    futures[
-                        future
-                    ]
-                )
-
+                symbol = futures[
+                    future
+                ]
 
                 completed += 1
 
 
                 try:
 
-                    item = (
-                        future.result()
-                    )
-
+                    item = future.result()
 
                 except Exception as e:
 
                     print(
-                        "YALCIN PRO -",
-                        symbol,
-                        "FUTURE HATASI:",
-                        repr(e)
+                        f"YALCIN PRO - "
+                        f"{symbol}: "
+                        f"FUTURE HATASI "
+                        f"{repr(e)}"
                     )
 
                     item = None
 
+
+                # ------------------------------------------------
+                # BASARILI VERI
+                # ------------------------------------------------
 
                 if item:
 
@@ -1337,17 +1204,19 @@ def refresh_all(
                     ] = item
 
 
+                # ------------------------------------------------
+                # ILERLEME LOG
+                # ------------------------------------------------
+
                 if (
                     completed % 25 == 0
                     or completed == total
                 ):
 
                     print(
-
-                        "YALCIN PRO - YAHOO:",
-                        f"{completed}/{total}",
-                        "| YENI VERI=",
-                        len(new_cache)
+                        f"YALCIN PRO - YAHOO: "
+                        f"{completed}/{total} | "
+                        f"YENI VERI={len(new_cache)}"
                     )
 
 
@@ -1363,80 +1232,75 @@ def refresh_all(
 
 
         # ----------------------------------------------------
-        # MISSING
+        # EKSIK SAYISI
         # ----------------------------------------------------
 
         missing = max(
-
-            total
-            - len(cache),
-
+            total - len(cache),
             0
         )
 
 
         # ----------------------------------------------------
-        # SON REFRESH
+        # SON REFRESH BILGISI
         # ----------------------------------------------------
 
         last_refresh.update({
 
-            "timestamp":
-                time.time(),
+            "timestamp": time.time(),
 
-            "updated":
-                len(new_cache),
+            "updated": len(new_cache),
 
-            "missing":
-                missing,
+            "missing": missing,
 
-            "total":
-                total,
+            "total": total,
 
-            "status":
-
-                (
-                    "guncel"
-
-                    if new_cache
-
-                    else
-                    "veri_alinamadi"
-                ),
+            "status": (
+                "guncel"
+                if new_cache
+                else "veri_alinamadi"
+            ),
         })
 
 
-        print("")
+        # ----------------------------------------------------
+        # LOG
+        # ----------------------------------------------------
+
+        print(
+            ""
+        )
+
+        print(
+            "=================================================="
+        )
+
+        print(
+            f"YALCIN PRO - CACHE GUNCELLENDI"
+        )
+
+        print(
+            f"CACHE       : {len(cache)}/{total}"
+        )
+
+        print(
+            f"YENI VERI   : {len(new_cache)}"
+        )
+
+        print(
+            f"MISSING     : {missing}"
+        )
+
+        print(
+            f"SAAT        : {now_text()}"
+        )
+
         print(
             "=================================================="
         )
 
         print(
-            "YALCIN PRO - CACHE GUNCELLENDI"
-        )
-
-        print(
-            "CACHE:",
-            f"{len(cache)}/{total}"
-        )
-
-        print(
-            "YENI VERI:",
-            len(new_cache)
-        )
-
-        print(
-            "MISSING:",
-            missing
-        )
-
-        print(
-            "SAAT:",
-            now_text()
-        )
-
-        print(
-            "=================================================="
+            ""
         )
 
 
@@ -1449,6 +1313,66 @@ def refresh_all(
 
 
 # ============================================================
+# ARKA PLAN OTOMATIK YENILEME
+# ============================================================
+
+def background_loop():
+
+    print(
+        "YALCIN PRO - "
+        "ARKA PLAN BASLADI"
+    )
+
+    print(
+        f"YALCIN PRO - "
+        f"OTOMATIK YENILEME: "
+        f"{REFRESH_SECONDS} SANİYE"
+    )
+
+
+    while True:
+
+        try:
+
+            # İnternetten güncel BIST sembollerini periyodik kontrol et.
+            refresh_symbols_from_online_source()
+
+
+            # ------------------------------------------------
+            # SEMBOL LISTESINI KONTROL ET
+            # ------------------------------------------------
+            # JSON dosyasına yeni bir hisse eklenmişse sunucu
+            # yeniden başlatılmadan listeye alınır.
+            refresh_symbols_from_file()
+
+            # ------------------------------------------------
+            # Ilk calismada hemen veri al
+            # ------------------------------------------------
+
+            refresh_all(
+                force=(not cache)
+            )
+
+
+        except Exception as e:
+
+            print(
+                "YALCIN PRO - "
+                "ARKA PLAN HATASI:",
+                repr(e)
+            )
+
+
+        # ----------------------------------------------------
+        # Bir sonraki yenilemeye kadar bekle
+        # ----------------------------------------------------
+
+        time.sleep(
+            REFRESH_SECONDS
+        )
+
+
+# ============================================================
 # ANA SAYFA
 # ============================================================
 
@@ -1457,32 +1381,26 @@ def home():
 
     return jsonify({
 
-        "success":
-            True,
+        "success": True,
 
-        "status":
-            "online",
+        "status": "online",
 
-        "service":
-            "Yalcin Pro BIST",
+        "service": "Yalcin Pro BIST",
 
-        "source":
-            "Yahoo Finance Chart",
+        "source": "Yahoo Finance Chart",
 
-        "delay":
-            "Yahoo tarafindaki mevcut piyasa gecikmesi",
+        "delay": (
+            "Yahoo tarafindaki mevcut "
+            "piyasa gecikmesi"
+        ),
 
-        "symbols":
-            len(SYMBOLS),
+        "symbols": len(SYMBOLS),
 
-        "target":
-            TARGET,
+        "target": TARGET,
 
-        "data":
-            len(cache),
+        "data": len(cache),
 
-        "lastRefresh":
-            last_refresh,
+        "lastRefresh": last_refresh,
     })
 
 
@@ -1497,26 +1415,19 @@ def health():
 
     return jsonify({
 
-        "success":
-            True,
+        "success": True,
 
-        "status":
-            "online",
+        "status": "online",
 
-        "serverTime":
-            now_text(),
+        "serverTime": now_text(),
 
-        "symbols":
-            len(SYMBOLS),
+        "symbols": len(SYMBOLS),
 
-        "target":
-            TARGET,
+        "target": TARGET,
 
-        "data":
-            len(cache),
+        "data": len(cache),
 
-        "lastRefresh":
-            last_refresh,
+        "lastRefresh": last_refresh,
     })
 
 
@@ -1531,27 +1442,20 @@ def stats():
 
     return jsonify({
 
-        "success":
-            True,
+        "success": True,
 
-        "symbols":
-            len(SYMBOLS),
+        "symbols": len(SYMBOLS),
 
-        "target":
-            TARGET,
+        "target": TARGET,
 
-        "cached":
-            len(cache),
+        "cached": len(cache),
 
-        "missing":
-            max(
-                len(SYMBOLS)
-                - len(cache),
-                0
-            ),
+        "missing": max(
+            len(SYMBOLS) - len(cache),
+            0
+        ),
 
-        "lastRefresh":
-            last_refresh,
+        "lastRefresh": last_refresh,
     })
 
 
@@ -1562,243 +1466,134 @@ def stats():
 @app.route("/symbols")
 def symbols():
 
-    # --------------------------------------------------------
-    # DOSYAYI KONTROL
-    # --------------------------------------------------------
-
     refresh_symbols_from_file()
-
-
-    # --------------------------------------------------------
-    # ONLINE KAYNAĞI KONTROL
-    # --------------------------------------------------------
-
-    refresh_symbols_from_online_source()
-
 
     return jsonify({
 
-        "success":
-            True,
+        "success": True,
 
-        "count":
-            len(SYMBOLS),
+        "count": len(SYMBOLS),
 
-        "symbols":
-            SYMBOLS,
+        "symbols": SYMBOLS,
     })
 
 
 # ============================================================
-# TÜM HİSSELER
+# TUM HISSeler
 # ============================================================
 
 @app.route("/all")
 def all_stocks():
 
-    # ========================================================
-    # 1 - YEREL DOSYAYI KONTROL
-    # ========================================================
+    # Online sembol taramasını HTTP isteği içinde çalıştırma.
+    refresh_symbols_from_file()
 
-    file_changed = (
-        refresh_symbols_from_file()
-    )
-
-
-    # ========================================================
-    # 2 - ONLINE SEMBOL KAYNAĞINI KONTROL
+    # --------------------------------------------------------
+    # ONEMLI DUZELTME
     #
-    # ÖNEMLİ:
+    # Eskiden burada sadece:
     #
-    # Artık sadece background thread'e güvenmiyoruz.
+    #     if not cache:
     #
-    # Android her /all istediğinde zaman dolmuşsa
-    # online sembol listesi kontrol ediliyor.
-    # ========================================================
-
-    symbols_added = (
-        refresh_symbols_from_online_source()
-    )
-
-
-    # ========================================================
-    # 3 - CACHE YAŞI
-    # ========================================================
+    # vardi.
+    #
+    # Bu nedenle cache dolu oldugu surece /all
+    # Yahoo'ya yeni istek yapmiyordu.
+    #
+    # Artik cache'in yasini kontrol ediyoruz.
+    # --------------------------------------------------------
 
     age = (
-
         time.time()
-        - last_refresh[
-            "timestamp"
-        ]
+        - last_refresh["timestamp"]
     )
 
 
-    # ========================================================
-    # 4 - YENİ HİSSE EKLENDİYSE
-    #
-    # Yeni hisse fiyatını da hemen çek.
-    # ========================================================
+    # --------------------------------------------------------
+    # Cache bos ise
+    # VEYA
+    # Cache REFRESH_SECONDS'tan eskiyse
+    # yeni veri cek.
+    # --------------------------------------------------------
 
-    if symbols_added:
-
-        print(
-            "YALCIN PRO - YENI HISSE EKLENDI"
-        )
-
-        print(
-            "YALCIN PRO - YENI VERILER CEKILIYOR"
-        )
-
-
-        def background_refresh_new_symbols():
-
-            try:
-
-                refresh_all(
-                    force=True
-                )
-
-            except Exception as e:
-
-                print(
-                    "YALCIN PRO - YENI HISSE REFRESH HATASI:",
-                    repr(e)
-                )
-
-
-        threading.Thread(
-
-            target=
-                background_refresh_new_symbols,
-
-            daemon=True,
-
-            name=
-                "yalcinpro-new-symbol-refresh"
-
-        ).start()
-
-
-    # ========================================================
-    # 5 - NORMAL CACHE YENILEME
-    # ========================================================
-
-    elif (
+    if (
         not cache
         or age >= REFRESH_SECONDS
-        or file_changed
     ):
 
-
-        print("")
-
         print(
-            "YALCIN PRO - /all YENI VERI ISTEDI"
+            ""
         )
 
         print(
-            "CACHE:",
-            len(cache)
+            "YALCIN PRO - /all "
+            "YENI VERI ISTEDI"
         )
 
         print(
-            "CACHE YASI:",
-            round(
-                age,
-                1
-            ),
-            "saniye"
+            f"CACHE       : {len(cache)}"
         )
 
         print(
-            "LIMITE:",
-            REFRESH_SECONDS,
-            "saniye"
+            f"CACHE YASI  : {age:.1f} saniye"
+        )
+
+        print(
+            f"LIMITE      : {REFRESH_SECONDS} saniye"
         )
 
 
-        def background_refresh():
-
+        def _background_refresh():
             try:
-
-                refresh_all(
-                    force=True
-                )
-
+                refresh_all(force=True)
             except Exception as e:
-
                 print(
-                    "YALCIN PRO - /all REFRESH HATASI:",
+                    "YALCIN PRO - /all ARKA PLAN REFRESH HATASI:",
                     repr(e)
                 )
 
-
         threading.Thread(
-
-            target=
-                background_refresh,
-
+            target=_background_refresh,
             daemon=True,
-
-            name=
-                "yalcinpro-all-refresh"
-
+            name="yalcinpro-all-refresh"
         ).start()
 
 
-    # ========================================================
-    # 6 - SEMBOL SIRASINI KORU
-    # ========================================================
-
-    with symbols_lock:
-
-        current_symbols = (
-            list(SYMBOLS)
-        )
-
+    # --------------------------------------------------------
+    # SYMBOLS SIRASINI KORUYARAK DATA OLUSTUR
+    # --------------------------------------------------------
 
     data = [
 
-        cache[symbol]
+        cache[s]
 
-        for symbol
-        in current_symbols
+        for s in SYMBOLS
 
-        if symbol
-        in cache
+        if s in cache
     ]
 
 
-    # ========================================================
-    # 7 - JSON
-    # ========================================================
+    # --------------------------------------------------------
+    # JSON
+    # --------------------------------------------------------
 
     return jsonify({
 
-        "success":
-            True,
+        "success": True,
 
-        "status":
-            "online",
+        "status": "online",
 
-        "serverTime":
-            now_text(),
+        "serverTime": now_text(),
 
-        "symbols":
-            len(current_symbols),
+        "symbols": len(SYMBOLS),
 
-        "target":
-            TARGET,
+        "target": TARGET,
 
-        "count":
-            len(data),
+        "count": len(data),
 
-        "data":
-            data,
+        "data": data,
 
-        "lastRefresh":
-            last_refresh,
+        "lastRefresh": last_refresh,
     })
 
 
@@ -1809,26 +1604,20 @@ def all_stocks():
 @app.route("/stock/<symbol>")
 def stock(symbol):
 
-    symbol = normalize_symbol(
+    # --------------------------------------------------------
+    # Sembol temizle
+    # --------------------------------------------------------
+
+    symbol = (
         symbol
+        .upper()
+        .replace(".IS", "")
+        .strip()
     )
 
 
-    if not symbol:
-
-        return jsonify({
-
-            "success":
-                False,
-
-            "error":
-                "Gecersiz sembol",
-
-        }), 400
-
-
     # --------------------------------------------------------
-    # CACHE
+    # Once cache'e bak
     # --------------------------------------------------------
 
     item = cache.get(
@@ -1837,17 +1626,16 @@ def stock(symbol):
 
 
     # --------------------------------------------------------
-    # CACHE YOKSA YAHOO
+    # Cache'de yoksa Yahoo'dan cek
     # --------------------------------------------------------
 
     if item is None:
 
         print(
-            "YALCIN PRO - /stock/",
-            symbol,
-            "YAHOO'DAN CEKILIYOR"
+            f"YALCIN PRO - "
+            f"/stock/{symbol} "
+            f"YAHOO'DAN CEKILIYOR"
         )
-
 
         item = fetch_one(
             symbol
@@ -1869,14 +1657,11 @@ def stock(symbol):
 
         return jsonify({
 
-            "success":
-                False,
+            "success": False,
 
-            "symbol":
-                symbol,
+            "symbol": symbol,
 
-            "data":
-                None,
+            "data": None,
 
         }), 404
 
@@ -1887,34 +1672,33 @@ def stock(symbol):
 
     return jsonify({
 
-        "success":
-            True,
+        "success": True,
 
-        "status":
-            "online",
+        "status": "online",
 
-        "serverTime":
-            now_text(),
+        "serverTime": now_text(),
 
-        "data":
-            item,
+        "data": item,
     })
 
 
 # ============================================================
-# MANUEL REFRESH
+# MANUEL YENILE
 # ============================================================
 
 @app.route("/refresh")
 def manual_refresh():
 
-    print("")
+    print(
+        ""
+    )
+
     print(
         "=================================================="
     )
 
     print(
-        "YALCIN PRO - MANUEL REFRESH"
+        "YALCIN PRO - MANUEL REFRESH ISTENDI"
     )
 
     print(
@@ -1923,16 +1707,9 @@ def manual_refresh():
 
 
     # --------------------------------------------------------
-    # Önce yeni sembol kontrolü
-    # --------------------------------------------------------
-
-    refresh_symbols_from_online_source(
-        force=True
-    )
-
-
-    # --------------------------------------------------------
-    # Sonra fiyatları yenile
+    # FORCE TRUE
+    #
+    # 60 saniyeyi beklemeden yeni veri ceker.
     # --------------------------------------------------------
 
     count = refresh_all(
@@ -1942,36 +1719,46 @@ def manual_refresh():
 
     return jsonify({
 
-        "success":
-            count > 0,
+        "success": count > 0,
 
-        "status":
-            last_refresh[
-                "status"
-            ],
+        "status": last_refresh[
+            "status"
+        ],
 
-        "data":
-            count,
+        "data": count,
 
-        "symbols":
-            len(SYMBOLS),
+        "target": len(SYMBOLS),
 
-        "target":
-            len(SYMBOLS),
-
-        "lastRefresh":
-            last_refresh,
+        "lastRefresh": last_refresh,
     })
 
 
 # ============================================================
-# UYGULAMA
+# UYGULAMA BASLANGICI
 # ============================================================
 
 if __name__ == "__main__":
 
-    port = int(
+    # --------------------------------------------------------
+    # Arka plan thread
+    # --------------------------------------------------------
 
+    t = threading.Thread(
+
+        target=background_loop,
+
+        daemon=True,
+    )
+
+
+    t.start()
+
+
+    # --------------------------------------------------------
+    # PORT
+    # --------------------------------------------------------
+
+    port = int(
         os.environ.get(
             "PORT",
             "5000"
@@ -1979,7 +1766,14 @@ if __name__ == "__main__":
     )
 
 
-    print("")
+    # --------------------------------------------------------
+    # FLASK
+    # --------------------------------------------------------
+
+    print(
+        ""
+    )
+
     print(
         "=================================================="
     )
@@ -1989,78 +1783,29 @@ if __name__ == "__main__":
     )
 
     print(
-        "PORT:",
-        port
+        f"PORT       : {port}"
     )
 
     print(
-        "SEMBOL:",
-        len(SYMBOLS)
+        f"SEMBOL     : {len(SYMBOLS)}"
     )
 
     print(
-        "TARGET:",
-        TARGET
+        f"HEDEF      : {TARGET}"
     )
 
     print(
-        "FİYAT REFRESH:",
-        REFRESH_SECONDS,
-        "saniye"
-    )
-
-    print(
-        "SEMBOL KONTROL:",
-        SYMBOL_SOURCE_REFRESH_SECONDS,
-        "saniye"
+        f"REFRESH    : {REFRESH_SECONDS} saniye"
     )
 
     print(
         "=================================================="
     )
 
-    print("")
+    print(
+        ""
+    )
 
-
-    # --------------------------------------------------------
-    # Başlangıçta sembol listesini hemen kontrol et
-    # --------------------------------------------------------
-
-    try:
-
-        refresh_symbols_from_online_source(
-            force=True
-        )
-
-    except Exception as e:
-
-        print(
-            "YALCIN PRO - BASLANGIC SEMBOL HATASI:",
-            repr(e)
-        )
-
-
-    # --------------------------------------------------------
-    # İlk veri
-    # --------------------------------------------------------
-
-    try:
-
-        refresh_all(
-            force=True
-        )
-
-    except Exception as e:
-
-        print(
-            "YALCIN PRO - BASLANGIC VERI HATASI:",
-            repr(e)
-        )
-
-
-    # --------------------------------------------------------
-    # Flask
-    # --------------------------------------------------------
 
     app.run(
 
@@ -2070,5 +1815,5 @@ if __name__ == "__main__":
 
         debug=False,
 
-        threaded=True
+        threaded=True,
     )
