@@ -951,31 +951,17 @@ def fetch_one(symbol):
 
 
             # ------------------------------------------------
-            # PREVIOUS CLOSE FALLBACK
+            # PREVIOUS CLOSE / DAILY CHANGE
+            # ------------------------------------------------
+            # Yahoo meta.previousClose can be wrong for DUNYH (in this
+            # case it returned 109.10 while the live quote was 12.27).
+            # For DUNYH, use the prior daily candle close as the reference
+            # whenever chart data has at least two valid closes.
+            # This is dynamic data, not a hardcoded percent.
             # ------------------------------------------------
 
-            if (
-                previous is None
-                and len(closes) >= 2
-            ):
-
-                previous = closes[-2]
-
-
             if previous is not None:
-
                 previous = float(previous)
-
-
-            # ====================================================
-            # DEGISIM YUZDESI - GUNCEL FIYAT / ONCEKI KAPANIS
-            # ====================================================
-            # Yuzde sabitlenmez ve belirli bir sinirla engellenmez.
-            # Esas referans Yahoo meta.previousClose alanidir.
-            # DUNYH'de bu alan bazen guncel fiyatla ayni gelebiliyor.
-            # Bu durumda 5 gunluk gunluk grafikte onceki mum kapanisini
-            # (closes[-2]) kontrol ederek sifir yuzde hatasini gider.
-            # ====================================================
 
             change_valid = True
 
@@ -988,43 +974,46 @@ def fetch_one(symbol):
 
                 chart_reference = (
                     float(closes[-2])
-                    if len(closes) >= 2 and closes[-2] > 0
+                    if len(closes) >= 2 and float(closes[-2]) > 0
                     else None
                 )
 
-                # Onceki kapanis eksikse veya fiyatla ayniysa,
-                # grafikteki onceki islem gunu kapanisini kullan.
-                same_as_price = (
-                    previous is not None
-                    and abs(float(previous) - price) < 0.000001
-                )
-
-                if (previous is None or same_as_price) and chart_reference:
+                # For this symbol, the daily chart's preceding candle is
+                # the reliable prior-session close; don't keep a bad meta
+                # value such as 109.10 merely because it is non-null.
+                if chart_reference is not None:
                     previous = chart_reference
                     print(
-                        f"YALCIN PRO - DUNYH PREVIOUS CLOSE FALLBACK: "
+                        f"YALCIN PRO - DUNYH CHART PREVIOUS CLOSE: "
                         f"{previous}"
+                    )
+                else:
+                    print(
+                        "YALCIN PRO - DUNYH: onceki gun kapanisi "
+                        "grafikten alinamadi; meta degeri kullanilacak."
                     )
 
                 print(
-                    f"YALCIN PRO - DUNYH REFERANS | "
+                    f"YALCIN PRO - DUNYH REFERENCE | "
                     f"PRICE={price} | PREVIOUS={previous}"
                 )
 
-            # Gunluk degisim: (guncel fiyat - onceki kapanis) / onceki kapanis
+            elif previous is None and len(closes) >= 2:
+                previous = float(closes[-2])
+
+            # Daily change: (live/current price - prior session close)
             change = None
 
             if previous is not None and float(previous) > 0:
                 previous = float(previous)
                 change = ((price - previous) / previous) * 100.0
 
-            # Kaynak referansi yoksa bunu acikca gecersiz bildir.
-            # Degisim yuzdesine yapay +9.95 / 0.00 atamasi yapilmaz.
+            # If no reference close exists, do not fabricate +9.95 or 0%.
             if symbol == "DUNYH":
                 change_valid = change is not None
                 if change is not None:
                     print(
-                        f"YALCIN PRO - DUNYH GUNCEL DEGISIM: "
+                        f"YALCIN PRO - DUNYH CALCULATED CHANGE: "
                         f"{change:.4f}%"
                     )
 
