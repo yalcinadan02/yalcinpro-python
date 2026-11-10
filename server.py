@@ -968,38 +968,87 @@ def fetch_one(symbol):
 
 
             # ====================================================
-            # DUNYH ONCEKI KAPANIS KONTROLU
+            # DUNYH / KAYNAK ANOMALISI KONTROLU
             # ====================================================
-            # DUNYH icin 44.56 gibi sabit bir onceki kapanis
-            # kullanilmaz. Sabit deger, piyasa verisi degistikce
-            # yanlis degisim yuzdesi uretebilir.
+            # Yahoo meta.previousClose bazen sembol/kurumsal islem
+            # kaynakli olarak fiyatla uyusmayabilir. Boyle bir durumda
+            # son kapanisi referans almak YANLIS olur; son kapanis
+            # bugunku mum olabilir ve fiyatla ayni degeri tasiyabilir.
             #
-            # Once Yahoo meta.previousClose kullanilir.
-            # Meta alani yoksa, chart kapanis serisindeki onceki
-            # gunun kapanisi fallback olarak kullanilir.
+            # 5 gunluk gunluk grafikte:
+            # - closes[-1]: en son gunun kapanisi (bugun aciksa anlik
+            #   fiyata yakin/guncellenen deger olabilir)
+            # - closes[-2]: onceki islem gununun kapanisi
+            #
+            # Anormal meta farkinda onceki mum kapanisini kullan.
+            # Bu da makul degilse degisim gecersiz sayilir. Kaynak
+            # verisini dogrulamadan hatali -%88 gibi sinyal uretilmez.
             # ====================================================
+
+            change_valid = True
 
             if symbol == "DUNYH":
                 print(
                     f"YALCIN PRO - DUNYH RAW | "
-                    f"PRICE={price} | "
-                    f"META_PREVIOUS={previous} | "
+                    f"PRICE={price} | META_PREVIOUS={previous} | "
                     f"CHART_CLOSINGS={closes}"
                 )
 
-                if previous is None and len(closes) >= 2:
-                    chart_previous = closes[-2]
+                raw_change = (
+                    ((price - previous) / previous) * 100.0
+                    if previous is not None and previous > 0
+                    else None
+                )
 
-                    if chart_previous is not None and chart_previous > 0:
-                        previous = float(chart_previous)
+                if raw_change is not None and abs(raw_change) > 10.5:
+                    # Mutlaka onceki gunun kapanisi: closes[-1] bugun
+                    # olabilir, bu nedenle referans olarak kullanilmaz.
+                    chart_reference = (
+                        float(closes[-2])
+                        if len(closes) >= 2 and closes[-2] > 0
+                        else None
+                    )
 
-                if previous is not None and previous <= 0:
-                    previous = None
+                    chart_change = (
+                        ((price - chart_reference) / chart_reference) * 100.0
+                        if chart_reference is not None
+                        else None
+                    )
+
+                    print(
+                        f"YALCIN PRO - DUNYH ANOMALI | "
+                        f"META_CHANGE={raw_change:.4f}% | "
+                        f"PREVIOUS_CANDLE_CLOSE={chart_reference} | "
+                        f"FALLBACK_CHANGE={chart_change}"
+                    )
+
+                    if (
+                        chart_change is not None
+                        and abs(chart_change) <= 10.5
+                    ):
+                        previous = chart_reference
+                    else:
+                        # Dogru referans teyit edilemiyor.
+                        previous = None
+                        change_valid = False
+
+                elif previous is None:
+                    # Meta alanı yoksa önceki günlük mum kapanışını dene.
+                    chart_reference = (
+                        float(closes[-2])
+                        if len(closes) >= 2 and closes[-2] > 0
+                        else None
+                    )
+
+                    if chart_reference is not None:
+                        previous = chart_reference
+                    else:
+                        change_valid = False
 
                 print(
-                    f"YALCIN PRO - DUNYH ONCEKI KAPANIS | "
-                    f"PRICE={price} | "
-                    f"PREVIOUS={previous}"
+                    f"YALCIN PRO - DUNYH REFERANS | "
+                    f"PRICE={price} | PREVIOUS={previous} | "
+                    f"VALID={change_valid}"
                 )
 
             # ------------------------------------------------
@@ -1018,6 +1067,20 @@ def fetch_one(symbol):
                     (price - previous)
                     / previous
                 ) * 100.0
+
+            # DUNYH icin referans dogrulanamadiysa yuzde degisim
+            # gecerli kabul edilmez. API uyumlulugu icin sayisal alan
+            # 0.0 kalir; changeValid=false ile istemci de sinyali
+            # bu veriye gore olusturmamali.
+            if symbol == "DUNYH" and (
+                change is not None and abs(change) > 10.5
+            ):
+                print(
+                    f"YALCIN PRO - DUNYH GECERSIZ DEGISIM ENGELLENDI: "
+                    f"{change:.4f}%"
+                )
+                change = None
+                change_valid = False
 
 
             # ------------------------------------------------
@@ -1100,6 +1163,12 @@ def fetch_one(symbol):
                 "paraBirimi": "TRY",
 
                 "currency": "TRY",
+
+                "changeValid": (
+                    bool(change is not None)
+                    if symbol == "DUNYH"
+                    else True
+                ),
             }
 
 
