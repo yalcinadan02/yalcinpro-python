@@ -5,6 +5,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify
@@ -953,11 +954,10 @@ def fetch_one(symbol):
             # ------------------------------------------------
             # PREVIOUS CLOSE / DAILY CHANGE
             # ------------------------------------------------
-            # Yahoo meta.previousClose can be wrong for DUNYH (in this
-            # case it returned 109.10 while the live quote was 12.27).
-            # For DUNYH, use the prior daily candle close as the reference
-            # whenever chart data has at least two valid closes.
-            # This is dynamic data, not a hardcoded percent.
+            # DUNYH'de Yahoo meta.previousClose yanlış (109.10) gelebiliyor.
+            # Günlük mumların timestamp'lerini İstanbul tarihine çevirerek
+            # bugünden önceki en son kapanmış seansın kapanışını seçiyoruz.
+            # Böylece [-2] gibi indeks varsayımına bağlı kalmıyoruz.
             # ------------------------------------------------
 
             if previous is not None:
@@ -966,37 +966,50 @@ def fetch_one(symbol):
             change_valid = True
 
             if symbol == "DUNYH":
+                timestamps = result[0].get("timestamp") or []
+                chart_reference = None
+                chart_reference_date = None
+                istanbul = ZoneInfo("Europe/Istanbul")
+                today_istanbul = datetime.now(istanbul).date()
+
+                # timestamps ve closes aynı sırada ve aynı uzunlukta olur.
+                # Bugünün mumu varsa onu değil, bugünden önceki son mumu al.
+                for ts, close_value in zip(timestamps, quote[0].get("close", []) if quote else []):
+                    if ts is None or close_value is None:
+                        continue
+                    try:
+                        close_float = float(close_value)
+                        candle_date = datetime.fromtimestamp(
+                            int(ts), tz=istanbul
+                        ).date()
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+
+                    if close_float > 0 and candle_date < today_istanbul:
+                        if chart_reference_date is None or candle_date > chart_reference_date:
+                            chart_reference = close_float
+                            chart_reference_date = candle_date
+
                 print(
-                    f"YALCIN PRO - DUNYH RAW | "
-                    f"PRICE={price} | META_PREVIOUS={previous} | "
-                    f"CHART_CLOSINGS={closes}"
+                    f"YALCIN PRO - DUNYH RAW | PRICE={price} | "
+                    f"META_PREVIOUS={previous} | "
+                    f"TIMESTAMPS={timestamps} | CHART_CLOSINGS={closes}"
                 )
 
-                chart_reference = (
-                    float(closes[-2])
-                    if len(closes) >= 2 and float(closes[-2]) > 0
-                    else None
-                )
-
-                # For this symbol, the daily chart's preceding candle is
-                # the reliable prior-session close; don't keep a bad meta
-                # value such as 109.10 merely because it is non-null.
                 if chart_reference is not None:
                     previous = chart_reference
                     print(
-                        f"YALCIN PRO - DUNYH CHART PREVIOUS CLOSE: "
-                        f"{previous}"
+                        f"YALCIN PRO - DUNYH PRIOR SESSION CLOSE: "
+                        f"DATE={chart_reference_date} | CLOSE={previous}"
                     )
                 else:
+                    # Do not trust the known bad metadata value when no
+                    # prior-session chart close can be verified.
+                    previous = None
                     print(
-                        "YALCIN PRO - DUNYH: onceki gun kapanisi "
-                        "grafikten alinamadi; meta degeri kullanilacak."
+                        "YALCIN PRO - DUNYH: onceki seans kapanisi "
+                        "tarih bilgisiyle dogrulanamadi."
                     )
-
-                print(
-                    f"YALCIN PRO - DUNYH REFERENCE | "
-                    f"PRICE={price} | PREVIOUS={previous}"
-                )
 
             elif previous is None and len(closes) >= 2:
                 previous = float(closes[-2])
@@ -1008,7 +1021,8 @@ def fetch_one(symbol):
                 previous = float(previous)
                 change = ((price - previous) / previous) * 100.0
 
-            # If no reference close exists, do not fabricate +9.95 or 0%.
+            # If no reference close exists, mark it invalid rather than
+            # manufacturing a percentage or retaining the wrong meta value.
             if symbol == "DUNYH":
                 change_valid = change is not None
                 if change is not None:
@@ -1016,7 +1030,6 @@ def fetch_one(symbol):
                         f"YALCIN PRO - DUNYH CALCULATED CHANGE: "
                         f"{change:.4f}%"
                     )
-
 
             # ------------------------------------------------
             # LOG
