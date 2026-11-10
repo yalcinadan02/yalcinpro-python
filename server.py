@@ -968,20 +968,18 @@ def fetch_one(symbol):
 
 
             # ====================================================
-            # DUNYH OZEL DUZELTME
+            # DUNYH ONCEKI KAPANIS KONTROLU
             # ====================================================
-            # Yahoo meta alaninda DUNYH icin 109.10 gibi
-            # uyumsuz bir previousClose gelebiliyor.
+            # DUNYH icin 44.56 gibi sabit bir onceki kapanis
+            # kullanilmaz. Sabit deger, piyasa verisi degistikce
+            # yanlis degisim yuzdesi uretebilir.
             #
-            # SADECE DUNYH icin meta previousClose'u kullanmiyoruz.
-            # Chart verisindeki son tamamlanmis gunun kapanisini
-            # referans aliyoruz.
-            #
-            # Diger 613 hissenin hesaplamasi aynen korunuyor.
+            # Once Yahoo meta.previousClose kullanilir.
+            # Meta alani yoksa, chart kapanis serisindeki onceki
+            # gunun kapanisi fallback olarak kullanilir.
             # ====================================================
 
             if symbol == "DUNYH":
-
                 print(
                     f"YALCIN PRO - DUNYH RAW | "
                     f"PRICE={price} | "
@@ -989,53 +987,20 @@ def fetch_one(symbol):
                     f"CHART_CLOSINGS={closes}"
                 )
 
-                if len(closes) >= 2:
+                if previous is None and len(closes) >= 2:
+                    chart_previous = closes[-2]
 
-                    # 5d/1d chart verisinde son eleman mevcut
-                    # gunun verisi olabilir. Bu nedenle bir onceki
-                    # kapanisi referans olarak aliyoruz.
-                    dunyh_previous = closes[-2]
+                    if chart_previous is not None and chart_previous > 0:
+                        previous = float(chart_previous)
 
-                    if (
-                        dunyh_previous is not None
-                        and dunyh_previous > 0
-                    ):
+                if previous is not None and previous <= 0:
+                    previous = None
 
-                        previous = float(dunyh_previous)
-
-                        # ------------------------------------------------
-                        # DUNYH OZEL KORUMA
-                        # ------------------------------------------------
-                        # Yahoo DUNYH icin chart/meta verisinde
-                        # 109.10 degerini hatali sekilde donduruyor.
-                        # Bu nedenle bugunku bilinen onceki kapanis
-                        # 44.56 TL kullaniliyor.
-                        #
-                        # SADECE DUNYH etkilenir.
-                        # Diger 613 hissenin kodu degismez.
-                        # ------------------------------------------------
-                        if abs(previous - 109.10) < 0.01:
-                            previous = 44.56
-
-                            print(
-                                f"YALCIN PRO - DUNYH SABIT DUZELTME | "
-                                f"PRICE={price} | "
-                                f"PREVIOUS={previous}"
-                            )
-                        else:
-                            print(
-                                f"YALCIN PRO - DUNYH DUZELTILDI | "
-                                f"PRICE={price} | "
-                                f"PREVIOUS={previous}"
-                            )
-
-                    else:
-
-                        print(
-                            "YALCIN PRO - DUNYH | "
-                            "GECERLI CHART KAPANISI BULUNAMADI"
-                        )
-
+                print(
+                    f"YALCIN PRO - DUNYH ONCEKI KAPANIS | "
+                    f"PRICE={price} | "
+                    f"PREVIOUS={previous}"
+                )
 
             # ------------------------------------------------
             # DEGISIM YUZDESI
