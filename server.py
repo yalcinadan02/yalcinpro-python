@@ -963,62 +963,74 @@ def fetch_one(symbol):
                 except (TypeError, ValueError):
                     previous = None
 
-            change_valid = previous is not None
-
             if symbol == "DUNYH":
-                today_istanbul = datetime.now(istanbul).date()
-                prior_candles = [
-                    candle for candle in candles if candle[0] < today_istanbul
-                ]
+                # ONCELIK: Yahoo meta.previousClose. Onceki surum bu alan
+                # makul olsa bile chart kapanisini zorla seciyordu; DUNYH
+                # chart verisindeki 109.10 gibi olcekli kapanis bu nedenle
+                # 12.27 TL fiyatla uyusmuyordu.
+                meta_previous = previous
+                meta_change = (
+                    ((price - meta_previous) / meta_previous) * 100.0
+                    if meta_previous is not None and meta_previous > 0
+                    else None
+                )
 
-                if prior_candles:
-                    latest_candle = max(prior_candles, key=lambda item: item[0])
-                    chart_reference_date = latest_candle[0]
-                    close_reference = latest_candle[1]
-                    adjusted_reference = latest_candle[2]
-
-                    # DUNYH'de Yahoo ham kapanis ile guncel fiyat farkli
-                    # fiyat olceginde gelebiliyor. Ayni seans icin hem ham
-                    # hem de adjusted close adaylarini test et; makul gunluk
-                    # degisim veren adayi kullan.
-                    candidates = []
-                    if close_reference and close_reference > 0:
-                        candidates.append(("close", close_reference))
-                    if adjusted_reference and adjusted_reference > 0:
-                        candidates.append(("adjclose", adjusted_reference))
-
-                    valid_candidates = [
-                        (kind, value, ((price - value) / value) * 100.0)
-                        for kind, value in candidates
-                        if abs(((price - value) / value) * 100.0) <= 15.0
+                if meta_change is not None and abs(meta_change) <= 15.0:
+                    previous = meta_previous
+                    print(
+                        "YALCIN PRO - DUNYH META ONCEKI KAPANIS KABUL: "
+                        f"KAPANIS={previous} | DEGISIM={meta_change:.4f}%"
+                    )
+                else:
+                    # Meta alani makul degilse son tamamlanmis chart mumunu
+                    # kullan; sadece fiyatla +/-15% icindeki deger kabul edilir.
+                    today_istanbul = datetime.now(istanbul).date()
+                    prior_candles = [
+                        candle for candle in candles if candle[0] < today_istanbul
                     ]
 
-                    if valid_candidates:
-                        kind, previous, candidate_change = valid_candidates[0]
-                        print(
-                            "YALCIN PRO - DUNYH ONCEKI KAPANIS ADAYI: "
-                            f"TARIH={chart_reference_date} | "
-                            f"KAYNAK={kind} | KAPANIS={previous} | "
-                            f"DEGISIM={candidate_change:.4f}%"
-                        )
+                    if prior_candles:
+                        latest_candle = max(prior_candles, key=lambda item: item[0])
+                        chart_reference_date = latest_candle[0]
+                        close_reference = latest_candle[1]
+                        adjusted_reference = latest_candle[2]
+
+                        candidates = []
+                        if close_reference and close_reference > 0:
+                            candidates.append(("close", close_reference))
+                        if adjusted_reference and adjusted_reference > 0:
+                            candidates.append(("adjclose", adjusted_reference))
+
+                        valid_candidates = [
+                            (kind, value, ((price - value) / value) * 100.0)
+                            for kind, value in candidates
+                            if abs(((price - value) / value) * 100.0) <= 15.0
+                        ]
+
+                        if valid_candidates:
+                            kind, previous, candidate_change = valid_candidates[0]
+                            print(
+                                "YALCIN PRO - DUNYH CHART KAPANIS KABUL: "
+                                f"TARIH={chart_reference_date} | "
+                                f"KAYNAK={kind} | KAPANIS={previous} | "
+                                f"DEGISIM={candidate_change:.4f}%"
+                            )
+                        else:
+                            previous = None
+                            print(
+                                "YALCIN PRO - DUNYH META/CHART KAPANIS "
+                                "MAKUL DEGIL; DEGISIM GECERSIZ. "
+                                f"META={meta_previous} | "
+                                f"TARIH={chart_reference_date} | "
+                                f"CLOSE={close_reference} | "
+                                f"ADJCLOSE={adjusted_reference}"
+                            )
                     else:
-                        # Eski/olcek farki olan kapanisi kullanip -80/-90%
-                        # gibi yanlis gunluk degisim gostermeyelim.
                         previous = None
                         print(
-                            "YALCIN PRO - DUNYH: HAM/DUZELTILMIS KAPANIS "
-                            "ADAYLARI MAKUL ARALIKTA DEGIL; DEGISIM GECERSIZ. "
-                            f"TARIH={chart_reference_date} | "
-                            f"CLOSE={close_reference} | "
-                            f"ADJCLOSE={adjusted_reference}"
+                            "YALCIN PRO - DUNYH: ONCEKI KAPANIS "
+                            "TARIHLE DOGRULANAMADI."
                         )
-                else:
-                    # Tarihli kapanis yoksa Yahoo meta.previousClose kullanma.
-                    previous = None
-                    print(
-                        "YALCIN PRO - DUNYH: onceki kapanis tarih ile "
-                        "dogrulanamadi; degisim gecersiz."
-                    )
 
             # Other tickers: Yahoo's previousClose is used when valid;
             # if absent, use the most recent chart candle before today.
