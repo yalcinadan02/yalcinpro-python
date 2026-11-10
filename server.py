@@ -1128,7 +1128,7 @@ def fetch_one(symbol):
                         4
                     )
                     if change is not None
-                    else 0.0
+                    else None
                 ),
 
 
