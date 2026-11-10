@@ -806,7 +806,7 @@ def fetch_one(symbol):
                 url,
                 params={
                     # 5 gunluk veri
-                    "range": "5d",
+                    "range": "1mo",
 
                     # Gunluk veri.
                     # regularMarketPrice meta alanindan
