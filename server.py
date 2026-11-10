@@ -899,135 +899,100 @@ def fetch_one(symbol):
 
 
             # ------------------------------------------------
-            # CHART KAPANISLARI
+            # CHART KAPANISLARI (timestamp ile birlikte)
             # ------------------------------------------------
+            indicators = result[0].get("indicators", {})
+            quote = indicators.get("quote", [])
+            raw_closes = quote[0].get("close", []) if quote else []
+            timestamps = result[0].get("timestamp") or []
 
-            indicators = result[0].get(
-                "indicators",
-                {}
-            )
-
-            quote = indicators.get(
-                "quote",
-                []
-            )
-
-            closes = []
-
-
-            if quote:
-
-                raw_closes = quote[0].get(
-                    "close",
-                    []
-                )
-
-                closes = [
-                    float(x)
-                    for x in raw_closes
-                    if x is not None
-                ]
-
+            # Kapanislari tarihleriyle eslestir; None degerleri ayiklayip
+            # indeksleri kaydirmak yanlis seans secimine neden olabilir.
+            candles = []
+            istanbul = ZoneInfo("Europe/Istanbul")
+            for ts, close_value in zip(timestamps, raw_closes):
+                if ts is None or close_value is None:
+                    continue
+                try:
+                    close_float = float(close_value)
+                    candle_date = datetime.fromtimestamp(
+                        int(ts), tz=istanbul
+                    ).date()
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if close_float > 0:
+                    candles.append((candle_date, close_float))
 
             # ------------------------------------------------
-            # PRICE FALLBACK
+            # FIYAT
             # ------------------------------------------------
-
-            if price is None and closes:
-
-                price = closes[-1]
-
+            if price is None and candles:
+                price = candles[-1][1]
 
             if price is None:
-
-                print(
-                    f"YALCIN PRO - {symbol}: "
-                    f"FIYAT BULUNAMADI"
-                )
-
+                print(f"YALCIN PRO - {symbol}: FIYAT BULUNAMADI")
                 return None
-
 
             price = float(price)
 
-
             # ------------------------------------------------
-            # PREVIOUS CLOSE / DAILY CHANGE
+            # ONCEKI KAPANIS / GUNLUK DEGISIM
             # ------------------------------------------------
-            # DUNYH'de Yahoo meta.previousClose yanlış (109.10) gelebiliyor.
-            # Günlük mumların timestamp'lerini İstanbul tarihine çevirerek
-            # bugünden önceki en son kapanmış seansın kapanışını seçiyoruz.
-            # Böylece [-2] gibi indeks varsayımına bağlı kalmıyoruz.
-            # ------------------------------------------------
-
+            # DUNYH icin Yahoo meta.previousClose hatali gelebiliyor.
+            # Tarihli gunluk mumlardan son tamamlanmis seansin kapanisini
+            # sec. Seans tarihini Istanbul saatine gore belirle.
             if previous is not None:
-                previous = float(previous)
+                try:
+                    previous = float(previous)
+                    if previous <= 0:
+                        previous = None
+                except (TypeError, ValueError):
+                    previous = None
 
-            change_valid = True
+            change_valid = previous is not None
 
             if symbol == "DUNYH":
-                timestamps = result[0].get("timestamp") or []
-                chart_reference = None
-                chart_reference_date = None
-                istanbul = ZoneInfo("Europe/Istanbul")
                 today_istanbul = datetime.now(istanbul).date()
+                prior_candles = [
+                    (d, c) for d, c in candles if d < today_istanbul
+                ]
 
-                # timestamps ve closes aynı sırada ve aynı uzunlukta olur.
-                # Bugünün mumu varsa onu değil, bugünden önceki son mumu al.
-                for ts, close_value in zip(timestamps, quote[0].get("close", []) if quote else []):
-                    if ts is None or close_value is None:
-                        continue
-                    try:
-                        close_float = float(close_value)
-                        candle_date = datetime.fromtimestamp(
-                            int(ts), tz=istanbul
-                        ).date()
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-
-                    if close_float > 0 and candle_date < today_istanbul:
-                        if chart_reference_date is None or candle_date > chart_reference_date:
-                            chart_reference = close_float
-                            chart_reference_date = candle_date
-
-                print(
-                    f"YALCIN PRO - DUNYH RAW | PRICE={price} | "
-                    f"META_PREVIOUS={previous} | "
-                    f"TIMESTAMPS={timestamps} | CHART_CLOSINGS={closes}"
-                )
-
-                if chart_reference is not None:
+                if prior_candles:
+                    chart_reference_date, chart_reference = max(
+                        prior_candles, key=lambda item: item[0]
+                    )
                     previous = chart_reference
                     print(
-                        f"YALCIN PRO - DUNYH PRIOR SESSION CLOSE: "
-                        f"DATE={chart_reference_date} | CLOSE={previous}"
+                        "YALCIN PRO - DUNYH ONCEKI SEANS KAPANISI: "
+                        f"TARIH={chart_reference_date} | KAPANIS={previous}"
                     )
                 else:
-                    # Do not trust the known bad metadata value when no
-                    # prior-session chart close can be verified.
+                    # Tarihli kapanis yoksa hatali meta degerini kullanma.
                     previous = None
                     print(
-                        "YALCIN PRO - DUNYH: onceki seans kapanisi "
-                        "tarih bilgisiyle dogrulanamadi."
+                        "YALCIN PRO - DUNYH: onceki kapanis tarih ile "
+                        "dogrulanamadi; degisim gecersiz."
                     )
 
-            elif previous is None and len(closes) >= 2:
-                previous = float(closes[-2])
+            # Other tickers: Yahoo's previousClose is used when valid;
+            # if absent, use the most recent chart candle before today.
+            elif previous is None:
+                today_istanbul = datetime.now(istanbul).date()
+                prior_candles = [
+                    (d, c) for d, c in candles if d < today_istanbul
+                ]
+                if prior_candles:
+                    _, previous = max(prior_candles, key=lambda item: item[0])
 
-            # Daily change: (live/current price - prior session close)
             change = None
-
-            if previous is not None and float(previous) > 0:
-                previous = float(previous)
+            if previous is not None and previous > 0:
                 change = ((price - previous) / previous) * 100.0
 
-            # If no reference close exists, mark it invalid rather than
-            # manufacturing a percentage or retaining the wrong meta value.
             if symbol == "DUNYH":
                 change_valid = change is not None
                 if change is not None:
                     print(
-                        f"YALCIN PRO - DUNYH CALCULATED CHANGE: "
+                        f"YALCIN PRO - DUNYH HESAPLANAN DEGISIM: "
                         f"{change:.4f}%"
                     )
 
@@ -1112,11 +1077,7 @@ def fetch_one(symbol):
 
                 "currency": "TRY",
 
-                "changeValid": (
-                    bool(change is not None)
-                    if symbol == "DUNYH"
-                    else True
-                ),
+                "changeValid": bool(change is not None),
             }
 
 
