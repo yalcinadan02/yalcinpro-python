@@ -966,10 +966,6 @@ def fetch_one(symbol):
             change_valid = previous is not None
 
             if symbol == "DUNYH":
-                # DUNYH: günlük yüzde için son tamamlanmış seansın HAM
-                # kapanışını kullan. Adjclose geçmiş fiyatı kurumsal
-                # işlemlere göre düzeltebildiği için günlük değişimde uygun
-                # değildir. Meta.previousClose yedek olarak tutulur.
                 today_istanbul = datetime.now(istanbul).date()
                 prior_candles = [
                     candle for candle in candles if candle[0] < today_istanbul
@@ -978,17 +974,50 @@ def fetch_one(symbol):
                 if prior_candles:
                     latest_candle = max(prior_candles, key=lambda item: item[0])
                     chart_reference_date = latest_candle[0]
-                    previous = latest_candle[1]
+                    close_reference = latest_candle[1]
+                    adjusted_reference = latest_candle[2]
+
+                    # DUNYH'de Yahoo ham kapanis ile guncel fiyat farkli
+                    # fiyat olceginde gelebiliyor. Ayni seans icin hem ham
+                    # hem de adjusted close adaylarini test et; makul gunluk
+                    # degisim veren adayi kullan.
+                    candidates = []
+                    if close_reference and close_reference > 0:
+                        candidates.append(("close", close_reference))
+                    if adjusted_reference and adjusted_reference > 0:
+                        candidates.append(("adjclose", adjusted_reference))
+
+                    valid_candidates = [
+                        (kind, value, ((price - value) / value) * 100.0)
+                        for kind, value in candidates
+                        if abs(((price - value) / value) * 100.0) <= 15.0
+                    ]
+
+                    if valid_candidates:
+                        kind, previous, candidate_change = valid_candidates[0]
+                        print(
+                            "YALCIN PRO - DUNYH ONCEKI KAPANIS ADAYI: "
+                            f"TARIH={chart_reference_date} | "
+                            f"KAYNAK={kind} | KAPANIS={previous} | "
+                            f"DEGISIM={candidate_change:.4f}%"
+                        )
+                    else:
+                        # Eski/olcek farki olan kapanisi kullanip -80/-90%
+                        # gibi yanlis gunluk degisim gostermeyelim.
+                        previous = None
+                        print(
+                            "YALCIN PRO - DUNYH: HAM/DUZELTILMIS KAPANIS "
+                            "ADAYLARI MAKUL ARALIKTA DEGIL; DEGISIM GECERSIZ. "
+                            f"TARIH={chart_reference_date} | "
+                            f"CLOSE={close_reference} | "
+                            f"ADJCLOSE={adjusted_reference}"
+                        )
+                else:
+                    # Tarihli kapanis yoksa Yahoo meta.previousClose kullanma.
+                    previous = None
                     print(
-                        "YALCIN PRO - DUNYH ONCEKI KAPANIS: "
-                        f"TARIH={chart_reference_date} | "
-                        f"KAYNAK=chart.close | KAPANIS={previous} | "
-                        f"FIYAT={price}"
-                    )
-                elif previous is None:
-                    print(
-                        "YALCIN PRO - DUNYH: chart'ta önceki seans "
-                        "kapanışı ve Yahoo meta.previousClose bulunamadı."
+                        "YALCIN PRO - DUNYH: onceki kapanis tarih ile "
+                        "dogrulanamadi; degisim gecersiz."
                     )
 
             # Other tickers: Yahoo's previousClose is used when valid;
@@ -1007,14 +1036,30 @@ def fetch_one(symbol):
                 change = ((price - previous) / previous) * 100.0
 
             if symbol == "DUNYH":
-                # Yüzdeyi %15 sınırıyla iptal edip 0.00'a düşürme.
-                # Önceki kapanış varsa hesaplanan değer döner, yoksa None.
+                # BIST'te olağan günlük hareketin çok dışındaki fark,
+                # fiyat ölçeği/kurumsal işlem kaynaklı veri uyuşmazlığı
+                # olabilir. Yanlış -80/-90% göstermemek için böyle bir
+                # durumda kapanışı ve yüzdeyi geçersiz işaretle.
+                # Fiyatlar eşleşene kadar uygulama bu değişimi kullanmasın.
+                if change is not None and abs(change) > 15.0:
+                    print(
+                        "YALCIN PRO - DUNYH VERI UYUSMAZLIGI: "
+                        f"FIYAT={price} | ONCEKI={previous} | "
+                        f"HESAP={change:.4f}% | DEGISIM GECERSIZ"
+                    )
+                    previous = None
+                    change = None
+
                 change_valid = change is not None
                 if change is not None:
                     print(
-                        "YALCIN PRO - DUNYH HESAPLANAN DEGISIM: "
-                        f"{change:.4f}% | ONCEKI={previous} | FIYAT={price}"
+                        f"YALCIN PRO - DUNYH HESAPLANAN DEGISIM: "
+                        f"{change:.4f}%"
                     )
+
+            # ------------------------------------------------
+            # LOG
+            # ------------------------------------------------
 
             if previous is None:
 
@@ -1085,7 +1130,7 @@ def fetch_one(symbol):
                         4
                     )
                     if change is not None
-                    else None
+                    else 0.0
                 ),
 
 
