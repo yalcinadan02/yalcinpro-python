@@ -964,127 +964,68 @@ def fetch_one(symbol):
                     previous = None
 
             if symbol == "DUNYH":
-                # DUNYH icin once Yahoo'nun quote endpoint'indeki dogrudan
-                # gunluk degisim verisini kullan. Chart endpoint'i bazen
-                # tarihsel kapanisi farkli olcekte dondurebiliyor.
-                quote_price = None
-                quote_previous = None
-                quote_change = None
-                try:
-                    quote_response = session.get(
-                        "https://query1.finance.yahoo.com/v7/finance/quote",
-                        params={"symbols": "DUNYH.IS"},
-                        timeout=REQUEST_TIMEOUT,
-                    )
-                    if quote_response.status_code == 200:
-                        quote_result = (
-                            quote_response.json()
-                            .get("quoteResponse", {})
-                            .get("result", [])
-                        )
-                        if quote_result:
-                            quote_item = quote_result[0]
-                            raw_quote_price = quote_item.get("regularMarketPrice")
-                            raw_quote_previous = quote_item.get(
-                                "regularMarketPreviousClose"
-                            )
-                            raw_quote_change = quote_item.get(
-                                "regularMarketChangePercent"
-                            )
-                            if raw_quote_price is not None and float(raw_quote_price) > 0:
-                                quote_price = float(raw_quote_price)
-                            if (
-                                raw_quote_previous is not None
-                                and float(raw_quote_previous) > 0
-                            ):
-                                quote_previous = float(raw_quote_previous)
-                            if raw_quote_change is not None:
-                                quote_change = float(raw_quote_change)
-                except (requests.RequestException, ValueError, TypeError, KeyError) as quote_error:
-                    print(
-                        "YALCIN PRO - DUNYH YAHOO QUOTE ALINAMADI: "
-                        f"{quote_error}"
-                    )
+                # Yahoo DUNYH icin chartPreviousClose alanini 109.10 gibi
+                # hatali/eski olcekli degerle dondurebiliyor. Ancak ayni
+                # chart meta icindeki fulldayChange ve fulldayChangePercent
+                # alanlari guncel fiyatla uyumlu (12.27, +1.11, +9.946%).
+                yahoo_day_change = meta.get("fulldayChange")
+                yahoo_day_percent = meta.get("fulldayChangePercent")
 
-                if quote_price is not None and quote_previous is not None:
-                    # Quote endpointindeki fiyat/kapanis ikilisi birlikte
-                    # kullanilir; degisim yuzdesi kapanistan yeniden hesaplanir.
-                    price = quote_price
-                    previous = quote_previous
-                    change = ((price - previous) / previous) * 100.0
-                    if quote_change is not None:
-                        # Yahoo'nun yuzdesi ve kapanistan hesaplanan deger
-                        # yuvarlama disinda uyusuyorsa dogrudan degeri al.
-                        if abs(quote_change - change) <= 0.15:
-                            change = quote_change
-                    print(
-                        "YALCIN PRO - DUNYH QUOTE KULLANILDI: "
-                        f"FIYAT={price} | ONCEKI={previous} | "
-                        f"GUNLUK={change:.4f}%"
-                    )
-                else:
-                    # Quote endpointi kullanilamazsa chart'in meta kapanisini
-                    # kontrol et; olcek hataliysa son tamamlanmis gunluk mumdan
-                    # yalnizca fiyata yakin kapanisi sec.
-                    meta_previous = previous
-                    meta_change = (
-                        ((price - meta_previous) / meta_previous) * 100.0
-                        if meta_previous is not None and meta_previous > 0
+                # Bazı Yahoo yanitlarinda isim regularMarketChangePercent olur.
+                if yahoo_day_percent is None:
+                    yahoo_day_percent = meta.get("regularMarketChangePercent")
+
+                try:
+                    yahoo_day_percent = (
+                        float(yahoo_day_percent)
+                        if yahoo_day_percent is not None
                         else None
                     )
+                except (TypeError, ValueError):
+                    yahoo_day_percent = None
 
-                    if meta_change is not None and abs(meta_change) <= 15.0:
-                        previous = meta_previous
+                try:
+                    yahoo_day_change = (
+                        float(yahoo_day_change)
+                        if yahoo_day_change is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    yahoo_day_change = None
+
+                if yahoo_day_percent is not None and abs(yahoo_day_percent) <= 100:
+                    change = yahoo_day_percent
+                    if yahoo_day_change is not None:
+                        # Mutlak gunluk degisimden onceki kapanisi geri bul.
+                        candidate_previous = price - yahoo_day_change
+                    else:
+                        # Mutlak degisim yoksa Yahoo yuzdesinden geri hesapla.
+                        candidate_previous = price / (1.0 + change / 100.0)
+
+                    if candidate_previous > 0:
+                        previous = candidate_previous
                         print(
-                            "YALCIN PRO - DUNYH META ONCEKI KAPANIS KABUL: "
-                            f"KAPANIS={previous} | DEGISIM={meta_change:.4f}%"
+                            "YALCIN PRO - DUNYH YAHOO GUNLUK META KULLANILDI: "
+                            f"FIYAT={price:.4f} | ONCEKI={previous:.4f} | "
+                            f"DEGISIM={change:.4f}%"
                         )
                     else:
-                        today_istanbul = datetime.now(istanbul).date()
-                        prior_candles = [
-                            candle for candle in candles if candle[0] < today_istanbul
-                        ]
-                        if prior_candles:
-                            latest_candle = max(
-                                prior_candles, key=lambda item: item[0]
-                            )
-                            chart_reference_date = latest_candle[0]
-                            close_reference = latest_candle[1]
-                            adjusted_reference = latest_candle[2]
-                            candidates = []
-                            if close_reference and close_reference > 0:
-                                candidates.append(("close", close_reference))
-                            if adjusted_reference and adjusted_reference > 0:
-                                candidates.append(("adjclose", adjusted_reference))
-                            valid_candidates = [
-                                (kind, value, ((price - value) / value) * 100.0)
-                                for kind, value in candidates
-                                if abs(((price - value) / value) * 100.0) <= 15.0
-                            ]
-                            if valid_candidates:
-                                kind, previous, candidate_change = valid_candidates[0]
-                                print(
-                                    "YALCIN PRO - DUNYH CHART KAPANIS KABUL: "
-                                    f"TARIH={chart_reference_date} | "
-                                    f"KAYNAK={kind} | KAPANIS={previous} | "
-                                    f"DEGISIM={candidate_change:.4f}%"
-                                )
-                            else:
-                                previous = None
-                                print(
-                                    "YALCIN PRO - DUNYH META/CHART KAPANIS "
-                                    "MAKUL DEGIL; DEGISIM GECERSIZ. "
-                                    f"META={meta_previous} | "
-                                    f"TARIH={chart_reference_date} | "
-                                    f"CLOSE={close_reference} | "
-                                    f"ADJCLOSE={adjusted_reference}"
-                                )
-                        else:
-                            previous = None
-                            print(
-                                "YALCIN PRO - DUNYH: ONCEKI KAPANIS "
-                                "TARIHLE DOGRULANAMADI."
-                            )
+                        previous = None
+                        change = None
+                        print(
+                            "YALCIN PRO - DUNYH META DEGERI GECERSIZ: "
+                            f"PRICE={price} | DAY_CHANGE={yahoo_day_change} | "
+                            f"DAY_PERCENT={yahoo_day_percent}"
+                        )
+                else:
+                    # Yahoo'nun gunluk meta degisimi yoksa guvenilir olmayan
+                    # chartPreviousClose (109.10) kullanilmaz.
+                    previous = None
+                    change = None
+                    print(
+                        "YALCIN PRO - DUNYH YAHOO GUNLUK DEGISIMI YOK: "
+                        f"PRICE={price} | META_PREVIOUS={meta.get('chartPreviousClose')}"
+                    )
 
             # Other tickers: Yahoo's previousClose is used when valid;
             # if absent, use the most recent chart candle before today.
@@ -1097,9 +1038,9 @@ def fetch_one(symbol):
                     latest_candle = max(prior_candles, key=lambda item: item[0])
                     previous = latest_candle[1]
 
-            # Gunluk degisim her zaman guncel fiyat ve onceki kapanistan hesaplanir.
-            # DUNYH icin quote endpointi yukarida change degerini set etmis olabilir.
-            if not (symbol == "DUNYH" and "change" in locals() and change is not None):
+            # DUNYH icin Yahoo'nun dogrudan gunluk yuzdesini koru.
+            # Diger sembollerde degisim onceki kapanistan hesaplanir.
+            if symbol != "DUNYH":
                 change = None
                 if previous is not None and previous > 0:
                     change = ((price - previous) / previous) * 100.0
